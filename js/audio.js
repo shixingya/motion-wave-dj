@@ -22,7 +22,7 @@
  *   noteToFreq('A4')           音名 → 频率，供创作模式映射音阶
  *
  * 二期扩展（Taylor）——新音色（t 一律为 ctx.currentTime 体系绝对时间）：
- *   play808(t, pitch=1)        808 风格长滑 Kick（sine 180→40Hz + tanh 软削波）
+ *   play808(t, pitch=1, dur=0.5) 808 风格长滑 Kick（sine 180→40Hz + tanh 软削波，衰减 dur 秒）
  *   playClap(t)                电鼓 Clap（3 连 10ms 噪声脉冲 + bandpass 1200Hz）
  *   playSupersaw(freq,t,dur)   EDM 主音（7 osc ±25 cents 扇形 saw + lowpass + ADSR）
  *   playBell(freq,t,dur)       FM 铃音（频比 3.5 + index 包络）
@@ -505,12 +505,14 @@ export class AudioEngine {
 
   /**
    * 808 风格长滑 Kick：sine 从 pitch*180Hz 快滑到 pitch*40Hz，
-   * 衰减 ~0.5s，经 tanh WaveShaper 软削波增加厚度。pitch 缩放整体音高。
+   * 衰减 dur 秒（clamp 0.3..2.5，默认 0.5s），经 tanh WaveShaper 软削波增加厚度。
+   * pitch 缩放整体音高；dur 支持长低音持续（Trap 808 bass 线），滑音/削波特征不变。
    */
-  play808(t, pitch = 1) {
+  play808(t, pitch = 1, dur = 0.5) {
     if (!this._ready()) return;
     t = this._t(t);
     pitch = clamp(Number(pitch) || 1, 0.25, 4);
+    dur = clamp(Number(dur) || 0.5, 0.3, 2.5);
     const osc = this.ctx.createOscillator();
     osc.type = 'sine';
     osc.frequency.setValueAtTime(180 * pitch, t);
@@ -520,10 +522,10 @@ export class AudioEngine {
     shaper.curve = this._satCurve;
     const gain = this.ctx.createGain();
     gain.gain.setValueAtTime(1.0, t);
-    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.5);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + dur);
     this._pipe(osc, shaper, gain);
     osc.start(t);
-    osc.stop(t + 0.55);
+    osc.stop(t + dur + 0.05);
   }
 
   /**
@@ -1108,7 +1110,7 @@ export class AudioEngine {
   /**
    * song 模式单步排程（16 步/小节，drum pattern 循环）：
    * drum 各轨道按 pattern 命中；bass 支持平铺或 4 小节变体数组，
-   * bassVoice='808' 时用 play808（pitch=freq/40）；
+   * bassVoice='808' 时用 play808（pitch=freq/40，dur=ev.dur 拍×beatDur，长低音持续）；
    * chordProg 每小节一个和弦在 step0 铺底（音量低）；
    * lead/fx 按 bar 预索引命中，lead 同时发 onNote 回调。
    */
@@ -1135,7 +1137,7 @@ export class AudioEngine {
         if (!ev || ev.step !== step) continue;
         const freq = noteToFreq(ev.note);
         if (song.bassVoice === '808') {
-          this.play808(time, freq / 40);
+          this.play808(time, freq / 40, clamp((Number(ev.dur) || 0.5) * beatDur, 0.3, 2.5));
         } else {
           this.playBass(freq, time, clamp((Number(ev.dur) || 0.5) * beatDur, 0.05, 2));
         }

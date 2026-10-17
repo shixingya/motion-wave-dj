@@ -19,6 +19,7 @@
  * 已知陷阱规避：
  *   - AudioContext 在用户手势回调（菜单点击）内 init+resume
  *   - 节拍脉冲用渲染循环比对 audioTime 驱动（过期拍立即补触发，不用 setTimeout）
+ *   - 加载窗口内 ESC 重进同模式：beginMode 会话令牌（beginSeq）作废旧 await 续体，防双感知实例泄漏
  *   - 全部用户可见文案为中文，不使用 emoji
  * ===================================================================== */
 
@@ -212,6 +213,7 @@ let poseCtl = null;       // initPose 返回的控制器（stop/fps/numPoses）
 let poseNumPoses = 0;     // 当前感知实例的人数档位（不匹配需重建）
 let latestPersons = [];   // 最近一帧姿态（onResults 异步写入，渲染循环消费）
 let poseFps = 0;
+let beginSeq = 0;         // beginMode 会话令牌：await initPose 返回后比对，过期则旧续体作废（防双实例泄漏）
 
 let pendingBeats = [];    // 待到点的拍 audioTime 队列（升序，onBeat 提前 ~0.1s 排入）
 let pulse = 0;            // 节拍脉冲 0..1：拍到点置 1，每帧 *0.85 衰减
@@ -389,7 +391,7 @@ function startDJ(song) {
   dj.scores = [0, 0];
   dj.combos = [0, 0];
   dj.maxCombos = [0, 0];
-  dj.clearAt = [0, 0];
+  dj.clearAt = [-(CLEAR_CD + 1), -(CLEAR_CD + 1)];   // 预冷却：AudioContext.currentTime 从 0 起，防开局 CLEAR_CD 内清屏被吞且无提示
   dj.startAt = 0;
   dj.fbNext = 0;
   dj.fbStep = 0;
@@ -606,7 +608,9 @@ function djTick() {
 
 function endDJ() {
   dj.ended = true;
-  audio.stopTrack();
+  /* 不调 audio.stopTrack()：endDJ 仅在 songDone（曲尾 _finishSong 已收尾，定时器/回调/游标均已清理）
+   * 后触发，此处 stopTrack 反而会硬切最后几颗 lead 长音的自然衰减尾音；
+   * 主动退出仍由 backToMenu 即时 stopTrack（预期硬切），不受影响 */
   dj.notes = [];
   stage.clearNotes();
   S.state = 'RESULT';
@@ -974,6 +978,7 @@ function onModeStart(mode, players) {
 }
 
 async function beginMode(mode, players) {
+  const myToken = ++beginSeq;   // 会话令牌：加载窗口内 ESC 回菜单后重进，旧 await 续体将因令牌过期作废
   S.state = 'PLAYING';
 
   /* 感知层：已初始化且人数档位匹配则复用；失败不阻塞，可玩键盘模式 */
@@ -994,8 +999,9 @@ async function beginMode(mode, players) {
         onResults: onPoseResults,
         onStatus: onPoseStatus,
       });
-      /* 打断复查：加载窗口（可 10 秒+）内 ESC 回菜单后，async 续体不得继续开播 */
-      if (S.state !== 'PLAYING' || S.mode !== mode) {
+      /* 打断复查：令牌过期（加载窗口内 ESC 后重进，新一轮 beginMode 已接管）
+       * 或状态/模式已变时，本续体作废——ctl 必须就地 stop，否则与新一轮实例并存泄漏 */
+      if (myToken !== beginSeq || S.state !== 'PLAYING' || S.mode !== mode) {
         ctl.stop();
         hideLoading();
         return;
@@ -1004,8 +1010,8 @@ async function beginMode(mode, players) {
       poseNumPoses = players;
       camOk = true;
     } catch (err) {
-      /* 失败路径同样复查：权限弹窗挂起期间也可能 ESC，失败后不得继续开播 */
-      if (S.state !== 'PLAYING' || S.mode !== mode) {
+      /* 失败路径同样复查：令牌过期 / 权限弹窗挂起期间 ESC，失败后不得继续开播 */
+      if (myToken !== beginSeq || S.state !== 'PLAYING' || S.mode !== mode) {
         hideLoading();
         return;
       }
