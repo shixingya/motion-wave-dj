@@ -43,13 +43,22 @@ jobs:
       - name: Configure Pages
         uses: actions/configure-pages@v4
 
-      # 3. 上传整仓为部署产物（path 指向仓库根，纯静态无构建）
+      # 3. 组装部署产物（仅站点文件：排除 test-results/、docs/ 等内部物料）
+      - name: Stage pages artifact
+        run: |
+          mkdir -p dist-pages
+          cp index.html dist-pages/
+          cp -r css js dist-pages/
+          cp README.md dist-pages/
+          touch dist-pages/.nojekyll
+
+      # 4. 上传部署产物（path 指向 staging 目录）
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: '.'
+          path: dist-pages
 
-      # 4. 正式发布到 GitHub Pages
+      # 5. 正式发布到 GitHub Pages
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4

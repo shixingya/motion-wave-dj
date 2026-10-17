@@ -265,6 +265,20 @@ function onDJBeat(beatIndex, barIndex, audioTime) {
   if (S.state !== 'PLAYING' || S.mode !== 'rhythm') return;
   pendingBeats.push(audioTime);
   const lane = TARGET_SEQ[beatIndex % TARGET_SEQ.length];
+  /* 旧拍补记 MISS：新 target 替换前，未判定玩家直接断连击
+   *（128BPM 时 djTick 的过期窗口仅约 69ms，低帧率下渲染帧可能来不及记） */
+  const old = dj.target;
+  if (old) {
+    let missAny = false;
+    for (let pi = 0; pi < S.players; pi++) {
+      if (!old.judged[pi]) {
+        old.judged[pi] = true;
+        dj.combos[pi] = 0;
+        missAny = true;
+      }
+    }
+    if (missAny) showJudge('MISS', '#ff5470');
+  }
   dj.target = { lane, audioTime, judged: [false, false] };
   showJudge(TARGET_LABEL[lane], '#ffd166');   // 目标提示（提前显示正好预备）
 }
@@ -651,15 +665,27 @@ async function beginMode(mode, players) {
         poseCtl = null;
         poseNumPoses = 0;
       }
-      poseCtl = await initPose({
+      const ctl = await initPose({
         videoEl: document.getElementById('camVideo'),
         numPoses: players,
         onResults: onPoseResults,
         onStatus: onPoseStatus,
       });
+      /* 打断复查：加载窗口（可 10 秒+）内 ESC 回菜单后，async 续体不得继续开播 */
+      if (S.state !== 'PLAYING' || S.mode !== mode) {
+        ctl.stop();
+        hideLoading();
+        return;
+      }
+      poseCtl = ctl;
       poseNumPoses = players;
       camOk = true;
     } catch (err) {
+      /* 失败路径同样复查：权限弹窗挂起期间也可能 ESC，失败后不得继续开播 */
+      if (S.state !== 'PLAYING' || S.mode !== mode) {
+        hideLoading();
+        return;
+      }
       camOk = false;
       poseCtl = null;
       poseNumPoses = 0;
@@ -700,6 +726,7 @@ function backToMenu() {
   audio.stopTrack();
   hideGuide();
   hideResult();
+  hideLoading();   // 加载期间 ESC：遮罩可能仍显示，回菜单必须收起
   clearJamTimers();
   dj.target = null;
   pendingBeats = [];

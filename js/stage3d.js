@@ -567,9 +567,9 @@ export class Stage3D {
       for (let i = 0; i < 33; i++) {
         const w = world ? world[i] : null;
         if (w && isFinite(w.x) && isFinite(w.y) && isFinite(w.z)) {
-          // 置信度：world 未带 visibility（pose.js 只映射 xyz），回退到 landmarks
-          const vis = (lm && lm[i] && typeof lm[i].visibility === 'number')
-            ? lm[i].visibility : 1;
+          // 置信度：world 未带置信度（pose.js 只映射 xyz），回退读 landmarks 的 v 字段
+          const vis = (lm && lm[i] && typeof lm[i].v === 'number')
+            ? lm[i].v : 1;
           if (vis < 0.25) { d.conf[i] = Math.max(0, d.conf[i] - 0.25); continue; } // 低置信度冻结该点
           // world 为米制、髋部原点：y 向下→向上取负，z 越小越近相机→镜像到 three +z 朝相机
           d.tgt[i].set(w.x, -w.y, -w.z);
@@ -577,7 +577,7 @@ export class Stage3D {
         } else if (lm && lm[i] && isFinite(lm[i].x)) {
           // 退化路径：无 world 时用归一化屏幕坐标粗略映射到人偶局部空间
           const l = lm[i];
-          const vis = (typeof l.visibility === 'number') ? l.visibility : 1;
+          const vis = (typeof l.v === 'number') ? l.v : 1;
           if (vis >= 0.25) {
             d.tgt[i].set((l.x - 0.5) * 1.6, (0.5 - l.y) * 1.9, -(l.z || 0) * 1.2);
             d.conf[i] = vis;

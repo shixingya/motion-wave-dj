@@ -189,7 +189,7 @@ export function drawSkeletons(persons) {
 export function setCamMode(hasCamera) {
   if (dom.camBox) dom.camBox.hidden = !hasCamera;    // 无摄像头：隐藏画中画
   if (dom.touchPad) dom.touchPad.hidden = !!hasCamera; // 同时显示键盘降级按钮
-  if (dom.pipTag && dom.camBox) dom.pipTag.hidden = dom.camBox.classList.contains('collapsed');
+  /* pipTag 显隐由 CSS（.collapsed .pip-tag）独立管理，此处不再写 hidden */
 }
 
 export function togglePiP() {

@@ -320,7 +320,8 @@ export function armRaised(landmarks, side) {
 }
 
 /* 下蹲判定（低音炮）：髋-膝垂直间距明显压缩。
- * 站立时 hipY 约比 kneeY 小 0.10~0.18（归一化），下蹲后间距趋近 0 甚至反超。
+ * BlazePose y 向下为正：站立时膝在髋下方，kneeY - hipY ≈ 0.10~0.25（归一化），
+ * 下蹲后髋膝间距压缩，kneeY - hipY 趋近 0 甚至为负（膝高过髋）。
  * 主阈值 0.06 为经验值；辅以 hipY > 0.5 排除"半身出画"等异常姿态。
  * 粗判定：game.js 侧建议再做保持帧数（如连续 2~3 帧）消抖。 */
 export function isSquat(landmarks) {
@@ -331,5 +332,5 @@ export function isSquat(landmarks) {
   if ([lh, rh, lk, rk].some((p) => p.v < V_MIN)) return false;
   const hipY = (lh.y + rh.y) / 2;
   const kneeY = (lk.y + rk.y) / 2;
-  return (hipY - kneeY) < 0.06 && hipY > 0.5;
+  return (kneeY - hipY) < 0.06 && hipY > 0.5;
 }
