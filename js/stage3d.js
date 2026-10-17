@@ -14,6 +14,8 @@
  *   7. 骨架人偶  33 关节 + 36 骨骼 InstancedMesh，P1 青 #00e5ff / P2 品红 #ff2bd6，
  *                姿态 lerp 0.3（按 dt 校正）平滑，无人自动淡出
  *   8. DJ 台 + 桁架  box/圆柱组合装饰，转盘随节拍旋转
+ *   9. 下落音符  QQ 炫舞式玩法（game.js 驱动）：4 lane 光带 + 判定线横条 +
+ *                菱形发光音符 mesh 池（48 个），命中爆裂 / MISS 灰淡，noteHit 粒子
  *
  * 依赖（index.html importmap，契约固定）：
  *   three / three/addons/postprocessing/{EffectComposer,RenderPass,
@@ -56,6 +58,17 @@ const POSE_BONES = [
   [23, 25], [24, 26], [25, 27], [26, 28],
   [27, 29], [28, 30], [29, 31], [30, 32], [27, 31], [28, 32],
 ];
+
+// —— 下落音符系统（QQ 炫舞式玩法，数据由 game.js 每帧喂入） ——
+const NOTE_LANES = 4;                     // lane 数（0~3）
+const NOTE_POOL = 48;                     // 音符 mesh 池上限（同屏上限）
+const LANE_X = [-2.4, -0.8, 0.8, 2.4];    // lane 世界坐标 x（对应地砖 4 列色带）
+const LANE_HEX = [0xffd700, 0x00e5ff, 0xff2bd6, 0x7cffb2]; // lane 色标：0 金/1 青/2 品红/3 绿
+const NOTE_Z_SPAWN = -6.0;                // 音符出生 z（舞台深处 LED 屏前）
+const NOTE_Z_JUDGE = 2.2;                 // 判定线 z（舞台前方玩家区）
+const NOTE_Y = 0.55;                      // 音符飞行高度
+const NOTE_FADE_HIT = 0.16;               // 命中爆裂淡出时长（秒）
+const NOTE_FADE_MISS = 0.28;              // MISS 灰色淡出时长（秒）
 
 const TILE_GRID = 12;       // 发光地砖阵列 12×12
 const TILE_CELL = 0.8;      // 单格边长（米）
@@ -100,6 +113,12 @@ export class Stage3D {
     this._hueB = MODE_PALETTES.dj.hueB;
     this._colorA = new THREE.Color();
     this._colorB = new THREE.Color();
+
+    // 下落音符系统（setNotes 每帧喂数据，内部管理 mesh 池；动画基于 dt）
+    this._noteSlots = new Map();    // uid -> slot（飞行/淡出中的音符）
+    this._noteFree = [];            // 空闲 slot 栈
+    this._noteSeen = new Set();     // 本帧仍在场上的 uid 集合（回收判定）
+    this._laneFlash = [0, 0, 0, 0]; // noteHit 爆闪能量 0..1（每 lane 独立衰减）
 
     // 复用临时对象，避免每帧分配触发 GC
     this._m4 = new THREE.Matrix4();
@@ -153,6 +172,7 @@ export class Stage3D {
     this._buildParticles();
     this._buildDolls();
     this._buildDJBooth();
+    this._buildNotes();
 
     this._initComposer();
     this.resize();
@@ -502,6 +522,58 @@ export class Stage3D {
     this._scene.add(g);
   }
 
+  /* -------------------------------------------------- 下落音符系统（DJ 玩法） */
+  _buildNotes() {
+    const g = new THREE.Group();
+    // —— lane 光带：舞台深处延伸到判定线的发光跑道（additive 半透明） ——
+    const stripLen = NOTE_Z_JUDGE - NOTE_Z_SPAWN;
+    const stripGeo = new THREE.PlaneGeometry(1.05, stripLen);
+    this._laneStrips = [];
+    for (let i = 0; i < NOTE_LANES; i++) {
+      const mat = new THREE.MeshBasicMaterial({
+        color: new THREE.Color(LANE_HEX[i]).multiplyScalar(0.55),
+        transparent: true, opacity: 0.12,
+        blending: THREE.AdditiveBlending, depthWrite: false,
+        side: THREE.DoubleSide, fog: false,
+      });
+      const strip = new THREE.Mesh(stripGeo, mat);
+      strip.rotation.x = -Math.PI / 2;
+      strip.position.set(LANE_X[i], 0.045, (NOTE_Z_SPAWN + NOTE_Z_JUDGE) / 2);
+      g.add(strip);
+      this._laneStrips.push(mat);
+    }
+    // —— 判定线：4 lane 分段发光横条（命中时对应段爆闪提亮） ——
+    const barGeo = new THREE.BoxGeometry(1.3, 0.06, 0.2);
+    this._judgeBars = [];
+    for (let i = 0; i < NOTE_LANES; i++) {
+      const mat = new THREE.MeshBasicMaterial({
+        color: new THREE.Color(LANE_HEX[i]).multiplyScalar(1.5),
+        fog: false,
+      });
+      const bar = new THREE.Mesh(barGeo, mat);
+      bar.position.set(LANE_X[i], 0.05, NOTE_Z_JUDGE);
+      g.add(bar);
+      this._judgeBars.push(mat);
+    }
+    // —— 音符 mesh 池：扁菱形发光块（Octahedron），long note 沿飞行方向拉长 ——
+    const noteGeo = new THREE.OctahedronGeometry(0.3, 0);
+    noteGeo.scale(1, 0.55, 1.6);
+    this._noteFree = [];
+    for (let i = 0; i < NOTE_POOL; i++) {
+      const mat = new THREE.MeshBasicMaterial({
+        color: 0xffffff, transparent: true, opacity: 1,
+        blending: THREE.AdditiveBlending, depthWrite: false, fog: false,
+      });
+      const mesh = new THREE.Mesh(noteGeo, mat);
+      mesh.visible = false;
+      g.add(mesh);
+      this._noteFree.push({ mesh, mat, state: 'fly', grade: null, fadeT: 0, dur: 0, lane: 0, p: 0, z: 0 });
+    }
+    g.visible = false;   // 仅 DJ 节奏模式显示（setMode 控制）
+    this._notesGroup = g;
+    this._scene.add(g);
+  }
+
   /* ============================ 对外契约 ============================ */
 
   /** 窗口尺寸变化（game.js 绑定 resize 事件） */
@@ -541,6 +613,7 @@ export class Stage3D {
     this._updateBurst(dt);
     this._updateDolls(dt, t);
     this._updateDJ(t, dt, beat);
+    this._updateNotes(dt, beat);
 
     // 相机呼吸微动（廉价高级感）
     this._camera.position.y = 3.2 + Math.sin(t * 0.5) * 0.09;
@@ -635,9 +708,166 @@ export class Stage3D {
     this._burstGeo.attributes.color.needsUpdate = true;
   }
 
-  /** 切换场景氛围配色：'dj'|'create'|'free' */
+  /* ---------------------- 下落音符（DJ 玩法对外契约） ---------------------- */
+
+  /**
+   * 每帧喂入音符数据（game.js 已算好飞行进度，本模块只负责渲染与淡出动画）。
+   * @param {number} now 当前时钟（契约保留位；动画基于 dt 推进，不直接用）
+   * @param {Array} notes [{ uid, lane, p, dur, state, grade }]
+   *   uid 稳定自增 id；p=0 出生 → 1 到判定线（可略超）；
+   *   state: 'fly'|'hit'|'miss'；grade: 'perfect'|'great'|'good'（hit 时）；
+   *   本次列表中消失的 uid 会被回收回 mesh 池。
+   */
+  setNotes(now, notes) {
+    if (!this._ready || !Array.isArray(notes)) return;
+    const seen = this._noteSeen;
+    seen.clear();
+    for (const n of notes) {
+      if (!n || typeof n.uid !== 'number') continue;
+      seen.add(n.uid);
+      let slot = this._noteSlots.get(n.uid);
+      if (!slot) {
+        slot = this._noteFree.pop();
+        if (!slot) continue;   // 池满（同屏超 48）：放弃渲染该音符
+        this._noteSlots.set(n.uid, slot);
+        slot.mesh.visible = true;
+        slot.state = 'fly';
+        slot.grade = null;
+        slot.fadeT = 0;
+      }
+      slot.lane = Math.min(NOTE_LANES - 1, Math.max(0, n.lane | 0));
+      slot.p = Math.min(Math.max(Number(n.p) || 0, 0), 1.15);
+      slot.dur = Number(n.dur) || 0;
+      // p=0 出生点（舞台深处）→ p=1 判定线；p>1 继续朝玩家越线（MISS 前过线视觉）
+      slot.z = NOTE_Z_SPAWN + slot.p * (NOTE_Z_JUDGE - NOTE_Z_SPAWN);
+      if ((n.state === 'hit' || n.state === 'miss') && slot.state === 'fly') {
+        slot.state = n.state;
+        slot.grade = n.grade || null;
+        slot.fadeT = 0;
+      }
+    }
+    // 回收：不在本次列表的 uid（game.js 已删除的音符）
+    for (const [uid, slot] of this._noteSlots) {
+      if (!seen.has(uid)) {
+        slot.mesh.visible = false;
+        this._noteSlots.delete(uid);
+        this._noteFree.push(slot);
+      }
+    }
+  }
+
+  /**
+   * 命中反馈：判定线对应 lane 爆闪 + 判定点粒子爆发
+   * @param {number} lane 0..3
+   * @param {string} grade 'perfect'|'great'|'good'
+   */
+  noteHit(lane, grade) {
+    if (!this._ready) return;
+    const i = Math.min(NOTE_LANES - 1, Math.max(0, lane | 0));
+    this._laneFlash[i] = 1;
+    const perfect = grade === 'perfect';
+    const c = this._c1.setHex(LANE_HEX[i]);
+    const n = perfect ? BURST_PER_HIT : Math.floor(BURST_PER_HIT * 0.55);
+    this._emitBurst(LANE_X[i], NOTE_Y + 0.1, NOTE_Z_JUDGE, c, n, perfect ? 2.2 : 1.5);
+    if (perfect) {
+      // PERFECT 额外喷一层白色高光粒子
+      this._emitBurst(LANE_X[i], NOTE_Y + 0.15, NOTE_Z_JUDGE,
+        this._c2.setRGB(1, 1, 1), Math.floor(BURST_PER_HIT * 0.35), 2.6);
+    }
+  }
+
+  /** 清空全部音符与爆闪状态（回菜单 / 重开局时调用） */
+  clearNotes() {
+    if (!this._ready) return;
+    for (const [uid, slot] of this._noteSlots) {
+      slot.mesh.visible = false;
+      this._noteFree.push(slot);
+    }
+    this._noteSlots.clear();
+    this._laneFlash = [0, 0, 0, 0];
+  }
+
+  /**
+   * 通用粒子喷发：在 (x,y,z) 沿半球喷 count 粒，HDR 基色随寿命平方衰减。
+   * 复用打击爆发粒子池（循环覆盖，无需额外分配）。
+   */
+  _emitBurst(x, y, z, color, count, up = 1.2) {
+    for (let j = 0; j < count; j++) {
+      const i = this._burstCursor;
+      this._burstCursor = (this._burstCursor + 1) % BURST_N;
+      this._burstPos[i * 3] = x;
+      this._burstPos[i * 3 + 1] = y;
+      this._burstPos[i * 3 + 2] = z;
+      const th = Math.random() * Math.PI * 2, sp = 2.2 + Math.random() * 3.6;
+      this._burstVel[i * 3] = Math.cos(th) * sp * 0.6;
+      this._burstVel[i * 3 + 1] = up * Math.sqrt(Math.random()) + Math.random() * 1.5;
+      this._burstVel[i * 3 + 2] = Math.sin(th) * sp * 0.6;
+      const ml = 0.7 + Math.random() * 0.6;
+      this._burstLife[i] = ml; this._burstMaxLife[i] = ml;
+      const k = 1.6 + Math.random() * 1.4;
+      this._burstBase[i * 3] = color.r * k;
+      this._burstBase[i * 3 + 1] = color.g * k;
+      this._burstBase[i * 3 + 2] = color.b * k;
+      this._burstCol[i * 3] = this._burstBase[i * 3];
+      this._burstCol[i * 3 + 1] = this._burstBase[i * 3 + 1];
+      this._burstCol[i * 3 + 2] = this._burstBase[i * 3 + 2];
+    }
+    this._burstGeo.attributes.position.needsUpdate = true;
+    this._burstGeo.attributes.color.needsUpdate = true;
+  }
+
+  /** 下落音符逐帧：lane 爆闪衰减 + 判定线/光带亮度 + 音符 mesh 动画 */
+  _updateNotes(dt, beat) {
+    if (!this._notesGroup || !this._notesGroup.visible) return;
+    // 判定线与光带：lane 爆闪能量指数衰减（帧率无关）
+    for (let i = 0; i < NOTE_LANES; i++) {
+      this._laneFlash[i] *= Math.exp(-dt * 5.5);
+      const f = this._laneFlash[i];
+      const base = this._c1.setHex(LANE_HEX[i]);
+      this._judgeBars[i].color.copy(base).multiplyScalar(1.5 + 4.5 * f + 0.6 * beat);
+      this._laneStrips[i].opacity = 0.10 + 0.05 * beat + 0.28 * f;
+    }
+    // 音符 mesh：飞行 / 命中爆裂 / MISS 灰淡
+    for (const slot of this._noteSlots.values()) {
+      const mesh = slot.mesh, mat = slot.mat;
+      const lx = LANE_X[slot.lane];
+      const base = this._c2.setHex(LANE_HEX[slot.lane]);
+      if (slot.state === 'fly') {
+        const zoom = 1 + Math.min(1, slot.p) * 0.35;              // 接近判定线轻微放大
+        const stretch = slot.dur > 0.5 ? 1 + slot.dur * 1.2 : 1;  // long note 拉长
+        mesh.position.set(lx, NOTE_Y, slot.z);
+        mesh.scale.set(zoom, zoom, zoom * stretch);
+        mat.color.copy(base).multiplyScalar(2.3);                 // HDR 亮度触发 bloom
+        mat.opacity = 1;
+      } else {
+        slot.fadeT += dt;
+        const dur = slot.state === 'miss' ? NOTE_FADE_MISS : NOTE_FADE_HIT;
+        const k = Math.min(1, slot.fadeT / dur);
+        mesh.position.set(lx, NOTE_Y, slot.z);
+        if (slot.state === 'miss') {
+          // MISS：降灰淡出（不触发 bloom）
+          mat.color.copy(base).multiplyScalar(0.35);
+          mat.opacity = 1 - k;
+          mesh.scale.setScalar(1 - k * 0.2);
+        } else {
+          // 命中：渐白 + 缩小爆裂
+          mat.color.setRGB(
+            base.r + (1 - base.r) * k,
+            base.g + (1 - base.g) * k,
+            base.b + (1 - base.b) * k
+          ).multiplyScalar(2.3 * (1 - k * 0.4));
+          mat.opacity = 1 - k;
+          mesh.scale.setScalar(1 - k * 0.55);
+        }
+        if (k >= 1) mesh.visible = false;
+      }
+    }
+  }
+
+  /** 切换场景氛围配色：'dj'|'create'|'free'（下落音符仅 dj 模式显示） */
   setMode(mode) {
     if (!MODE_PALETTES[mode]) mode = 'dj';
+    if (this._notesGroup) this._notesGroup.visible = mode === 'dj';
     if (mode === this._mode) return;
     this._mode = mode;
     this._refreshConfettiColors();

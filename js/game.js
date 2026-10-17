@@ -2,17 +2,20 @@
  * MOTION WAVE DJ · 主控制器（js/game.js）—— 任务 4 · Jay
  * ---------------------------------------------------------------------
  * 职责：
- *   - 游戏状态机：MENU → GUIDE(每模式首次) → PLAYING → RESULT(仅 DJ) → MENU
- *   - 三模式玩法编排：DJ 节奏（节拍对齐判定）/ 乐器创作（身体即乐器 + 录制回放）
- *     / 自由舞台（无评分畅玩）
+ *   - 游戏状态机：MENU → PICKING(DJ 选曲 / 创作选乐器) → GUIDE(每模式首次) → PLAYING → RESULT(仅 DJ) → MENU
+ *   - 三模式玩法编排：DJ 节奏（QQ 炫舞式下落音符判定）/
+ *     乐器创作（选乐器 + 身体演奏 + 录制回放）/ 自由舞台（无评分畅玩）
  *   - 渲染循环（dt + 节拍脉冲）、键盘降级、调试面板刷新、ESC 回菜单
  * 依赖契约（与队友模块逐一对齐）：
  *   ui.js      initUI/showLoading/hideLoading/setHud/showJudge/drawSkeletons/
- *              setCamMode/showGuide/hideGuide/setGuideDismissed/toggleDebug
+ *              setCamMode/showGuide/hideGuide/setGuideDismissed/toggleDebug/
+ *              showSongPicker/hideSongPicker/showInstrumentPicker/hideInstrumentPicker
  *   pose.js    initPose({videoEl,numPoses,onResults,onStatus}) / armRaised / isSquat
- *   audio.js   AudioEngine（init/resume/playKick 等全部 play 方法/startTrack/stopTrack） / noteToFreq
- *   stage3d.js Stage3D(init/resize/render/setPose/flash/spawnBurst/
- *              setMode/setPlayers/getStats)
+ *   audio.js   AudioEngine（init/resume/playKick 等 play 方法/startSong/stopTrack/
+ *              getUserTrackInfo） / noteToFreq
+ *   tracks.js  SONGS/getSongById/songsByDifficulty（曲库，Taylor 提供，仅 import 使用）
+ *   stage3d.js Stage3D(init/resize/render/setPose/flash/spawnBurst/setNotes/noteHit/
+ *              clearNotes/setMode/setPlayers/getStats)
  * 已知陷阱规避：
  *   - AudioContext 在用户手势回调（菜单点击）内 init+resume
  *   - 节拍脉冲用渲染循环比对 audioTime 驱动（过期拍立即补触发，不用 setTimeout）
@@ -21,17 +24,33 @@
 
 import {
   initUI, showLoading, hideLoading, setHud, showJudge, drawSkeletons,
-  setCamMode, showGuide, hideGuide, setGuideDismissed, toggleDebug
+  setCamMode, showGuide, hideGuide, setGuideDismissed, toggleDebug,
+  showSongPicker, hideSongPicker, showInstrumentPicker, hideInstrumentPicker
 } from './ui.js';
 import { initPose, armRaised, isSquat } from './pose.js';
 import { AudioEngine, noteToFreq } from './audio.js';
+import { songsByDifficulty } from './tracks.js';
 import { Stage3D } from './stage3d.js';
 
 /* ============================== 常量配置 ============================== */
 
-const DJ_DURATION = 90;          // DJ 模式曲目时长（秒）
-const PERFECT_WIN = 0.15;        // PERFECT 判定窗口（秒）
-const GOOD_WIN = 0.30;           // GOOD 判定窗口（秒）
+/* —— QQ 炫舞式下落音符（DJ 模式） —— */
+const NOTE_TRAVEL = 2.0;         // 音符飞行时长（秒）：出生点 → 判定线
+const WIN_PERFECT = 0.12;        // PERFECT ±120ms = 300 分
+const WIN_GREAT = 0.22;          // GREAT ±220ms = 200 分
+const WIN_GOOD = 0.32;           // GOOD ±320ms = 100 分（早按侧；晚按侧受 MISS_GRACE 截断）
+const MISS_GRACE = 0.25;         // 音符越过判定线 0.25s 仍未判 → MISS（断连击）
+const SCORE_BASE = { perfect: 300, great: 200, good: 100 };
+const JUDGE_LABEL = { perfect: 'PERFECT', great: 'GREAT', good: 'GOOD', miss: 'MISS' };
+const JUDGE_COLOR = { perfect: '#ffd700', great: '#7cffb2', good: '#00e5ff', miss: '#ff5470' };
+const GRADE_RANK = { perfect: 0, great: 1, good: 2, miss: 3 };
+const CLEAR_WINDOW = 2.0;        // 清屏技：清除未来 2 秒内未判音符
+const CLEAR_CD = 5.0;            // 清屏技冷却（秒）
+const FB_BPM = 120;              // 音频不可用兜底：本地节奏 BPM
+const FB_LEN = 60;               // 兜底曲长（秒）
+/* 动作 → 音符 lane 映射（左臂=lane1 左，右臂=lane2 右，双手=lane0+lane3 双押） */
+const ACT_LANES = { left: [1], right: [2], both: [0, 3] };
+
 const ARM_CD_DJ = 300;           // DJ / 自由模式举手冷却（毫秒，保持式）
 const ARM_CD_CREATE = 200;       // 创作模式挥臂冷却（毫秒/侧）
 const GTR_CD = 150;              // 吉他下压防抖（毫秒）
@@ -41,24 +60,139 @@ const BOTH_CD = 500;             // 双手同举冷却（毫秒）
 const REC_SECONDS = 8;           // 创作模式录制时长（秒）
 const BEST_KEY = 'mwdj_best_v1'; // 历史最高分 localStorage 键
 
-const STYLES = ['house', 'edm', 'funk'];               // 曲风轮换
-/* 拍目标动作轮换（8 拍一循环，下蹲每 8 拍出现一次防过劳） */
-const TARGET_SEQ = ['left', 'right', 'left', 'both', 'right', 'left', 'both', 'squat'];
-const TARGET_LABEL = { left: '左臂高举', right: '右臂高举', both: '双手高举', squat: '下蹲' };
-
 const PENTA = ['C4', 'D4', 'E4', 'G4', 'A4', 'C5', 'D5', 'E5'];   // C 大调五声 8 音
 const GTR_NOTES = ['E2', 'A2', 'D3', 'G3', 'B3', 'E4'];           // 吉他扫弦音域（低→高）
 const CHORDS = [                                                   // 下蹲和弦轮换 C-F-G-Am
   ['C3', 'E3', 'G3'], ['F3', 'A3', 'C4'], ['G3', 'B3', 'D4'], ['A3', 'C4', 'E4']
 ];
 
+/* —— 创作模式乐器包（6 个）：手势映射规则不变，音色随包切换 ——
+ * 包方法约定：scale(音阶序号, t) 左臂挥动 / strum(音域序号, t) 右手扫弦 /
+ * chord(轮换序号, t) 下蹲 / egg(t) 双手同举彩蛋；
+ * jam 的 kind 映射：'piano'→scale 'guitar'→strum 'chord'→chord 'cymbal'→egg，
+ * 录制回放复用同一映射，音色自动跟随回放时所选包 */
+const INSTRUMENT_KEY = 'mwdj_instrument_v1';   // 上次所选乐器 localStorage 键
+
+/* 和弦进行取音：order 为包特有轮换顺序（八音盒 Am-F-C-G），默认 C-F-G-Am */
+function chordNotesAt(ci, order) {
+  const idx = order ? order[ci % order.length] : (ci % CHORDS.length);
+  return CHORDS[idx] || CHORDS[0];
+}
+
+const INSTRUMENTS = [
+  {
+    id: 'piano', name: '梦幻钢琴', desc: '柔和钢琴音阶 · 吉他琶音扫弦 · 铃音彩蛋',
+    scale(i, t) {
+      audio.playPiano(noteToFreq(PENTA[clamp(i, 0, PENTA.length - 1)]), t, 0.5);
+    },
+    strum(i, t) {   // 吉他自下而上 3 音快速琶音
+      const s = clamp(i, 0, GTR_NOTES.length - 3);
+      for (let k = 0; k < 3; k++) audio.playGuitar(noteToFreq(GTR_NOTES[s + k]), t + k * 0.025);
+    },
+    chord(ci, t) {  // playChord 复用钢琴音色作底
+      audio.playChord(chordNotesAt(ci, this.chordOrder).map(noteToFreq), t, 1.0);
+    },
+    egg(t) { audio.playBell(noteToFreq('A5'), t, 1.2); },
+  },
+  {
+    id: 'guitar', name: '电吉他', desc: '拨弦音阶 · 密集强扫 · 上扬音效彩蛋',
+    scale(i, t) {
+      audio.playGuitar(noteToFreq(PENTA[clamp(i, 0, PENTA.length - 1)]), t);
+    },
+    strum(i, t) {   // 连续 5 音快速 strum，力度更足
+      const s = clamp(i, 0, GTR_NOTES.length - 5);
+      for (let k = 0; k < 5; k++) audio.playGuitar(noteToFreq(GTR_NOTES[s + k]), t + k * 0.018);
+    },
+    chord(ci, t) {  // 3 音拨弦叠低音量和弦铺底（playChord 多音自分摊音量）
+      const ch = chordNotesAt(ci, this.chordOrder);
+      for (let k = 0; k < ch.length; k++) audio.playGuitar(noteToFreq(ch[k]), t + k * 0.03);
+      audio.playChord(ch.map(noteToFreq), t + 0.05, 0.9);
+    },
+    egg(t) { audio.playRiser(t, 0.5); },   // 短上扬
+  },
+  {
+    id: 'organ', name: '双排键', desc: '风琴感和弦声 · 大叠音和弦 · 镲片彩蛋',
+    scale(i, t) {   // 短 dur + lowpass（playSupersaw 内建）= 风琴感
+      audio.playSupersaw(noteToFreq(PENTA[clamp(i, 0, PENTA.length - 1)]), t, 0.3);
+    },
+    strum(i, t) {
+      const s = clamp(i, 0, GTR_NOTES.length - 3);
+      for (let k = 0; k < 3; k++) audio.playSupersaw(noteToFreq(GTR_NOTES[s + k]), t + k * 0.035, 0.25);
+    },
+    chord(ci, t) {  // 3 度堆叠 + 高八度大叠音
+      const ch = chordNotesAt(ci, this.chordOrder).map(noteToFreq);
+      audio.playChord(ch.concat(ch.map((f) => f * 2)), t, 1.2);
+    },
+    egg(t) { audio.playCymbal(t); },
+  },
+  {
+    id: 'synth', name: '电子合成器', desc: '超锯齿主音 · 拨弦三连扫 · 重锤彩蛋',
+    scale(i, t) {
+      audio.playSupersaw(noteToFreq(PENTA[clamp(i, 0, PENTA.length - 1)]), t, 0.5);
+    },
+    strum(i, t) {   // playPluck 快速 3 连
+      const s = clamp(i, 0, GTR_NOTES.length - 3);
+      for (let k = 0; k < 3; k++) audio.playPluck(noteToFreq(GTR_NOTES[s + k]), t + k * 0.028, 0.18);
+    },
+    chord(ci, t) {  // 长音叠
+      const ch = chordNotesAt(ci, this.chordOrder);
+      for (const n of ch) audio.playSupersaw(noteToFreq(n), t, 1.2);
+    },
+    egg(t) { audio.playImpact(t); },
+  },
+  {
+    id: 'musicbox', name: '八音盒', desc: '清脆铃音 · 双音轻扫 · 分解和弦 · 高八度彩蛋',
+    chordOrder: [3, 1, 0, 2],   // 特有进行：Am-F-C-G 轮换
+    scale(i, t) {
+      audio.playBell(noteToFreq(PENTA[clamp(i, 0, PENTA.length - 1)]), t, 0.7);
+    },
+    strum(i, t) {   // 双音轻扫
+      const s = clamp(i, 0, GTR_NOTES.length - 2);
+      audio.playBell(noteToFreq(GTR_NOTES[s]), t, 0.5);
+      audio.playBell(noteToFreq(GTR_NOTES[s + 1]), t + 0.02, 0.5);
+    },
+    chord(ci, t) {  // 3 音分解：30ms 间隔琶音
+      const ch = chordNotesAt(ci, this.chordOrder);
+      ch.forEach((n, k) => audio.playBell(noteToFreq(n), t + k * 0.03, 0.9));
+    },
+    egg(t) { audio.playBell(noteToFreq('E6'), t, 1.5); },   // 音阶顶音高八度
+  },
+  {
+    id: 'chip', name: '8bit 芯片', desc: '芯片弹拨音 · 16 分快扫 · 同时和弦 · 808 彩蛋',
+    scale(i, t) {
+      audio.playPluck(noteToFreq(PENTA[clamp(i, 0, PENTA.length - 1)]), t, 0.18);
+    },
+    strum(i, t) {   // 4 连 16 分密度快扫
+      const s = clamp(i, 0, GTR_NOTES.length - 4);
+      for (let k = 0; k < 4; k++) audio.playPluck(noteToFreq(GTR_NOTES[s + k]), t + k * 0.07, 0.12);
+    },
+    chord(ci, t) {  // 3 音同时
+      const ch = chordNotesAt(ci, this.chordOrder);
+      for (const n of ch) audio.playPluck(noteToFreq(n), t, 0.4);
+    },
+    egg(t) { audio.play808(t, 1.5); },
+  },
+];
+
+/* 上次所选乐器持久化：存包 id（包顺序调整不失效）；读写全程 try/catch（隐私模式容错） */
+function loadInstrumentId() {
+  try {
+    const id = localStorage.getItem(INSTRUMENT_KEY);
+    if (id && INSTRUMENTS.some((p) => p.id === id)) return id;
+  } catch (e) { /* 忽略 */ }
+  return INSTRUMENTS[0].id;
+}
+
+function saveInstrumentId(id) {
+  try { localStorage.setItem(INSTRUMENT_KEY, String(id)); } catch (e) { /* 忽略 */ }
+}
+
 const CHEERS = ['太棒了！', '保持节奏！', '就是这个感觉！', '跟着灯光摇摆！', '你是最棒的！', '节奏不能停！'];
 const MODE_LABEL = { rhythm: 'DJ 节奏', instrument: '乐器创作', free: '自由舞台' };
 /* ui 菜单 mode → stage3d 氛围配色 mode */
 const STAGE_MODE = { rhythm: 'dj', instrument: 'create', free: 'free' };
 
-/* 评级阈值参考：90 秒约 180 拍，全 PERFECT 满分约 26500，
- * S≈60% 满打 / A≈40% / B≈20%，其余 C */
+/* 结算评级（按本曲满分估算比例：S≥55% / A≥40% / B≥25%，其余 C） */
 const GRADE_COLOR = { S: '#ffd700', A: '#00e5ff', B: '#7b2bff', C: '#8a86a3' };
 
 /* ============================== 全局状态 ============================== */
@@ -94,19 +228,26 @@ function mkMotion() {
 }
 const motion = [mkMotion(), mkMotion()];
 
-/* DJ 模式状态 */
+/* DJ 模式状态（QQ 炫舞式下落音符） */
 const dj = {
-  target: null,           // { lane, audioTime, judged:[bool, bool] } —— 判定标记按玩家独立
+  song: null,             // 当前曲目（tracks.js 数据）
+  notes: [],              // 飞行中 / 淡出中的音符
+  noteSeq: 0,             // 音符 uid 自增（stage3d mesh 池绑定键）
+  maxPossible: 0,         // 满分估算：Σ 每音符 300 × 加成上界 1.5
   scores: [0, 0],
   combos: [0, 0],
   maxCombos: [0, 0],
-  startAt: 0,             // 曲目起始（AudioContext 时钟，优先）
-  wallStart: 0,           // 曲目起始（performance.now 兜底，音频不可用时用）
-  styleIdx: 0,            // 曲风轮换游标
-  retryAt: 0,             // 续播重试冷却时间戳（performance.now，startTrack 报错时限流）
+  clearAt: [0, 0],        // 清屏技上次触发时刻（noteClock 秒，按玩家独立冷却）
+  startAt: 0,             // 开局时刻（noteClock：AudioContext 优先，兜底 performance.now）
+  audioOk: false,         // startSong 是否成功（失败切换本地兜底节奏流）
+  fbNext: 0,              // 兜底流下一音符 hitTime（noteClock 秒）
+  fbStep: 0,              // 兜底流步进游标
+  songEndAt: 0,           // 曲目停止时刻（结算确认 / 强制结算安全网）
+  ended: false,           // 是否已触发结算
 };
 
 /* 创作模式状态 */
+let instrumentIdx = 0;   // 当前乐器包下标（INSTRUMENTS，选乐器面板确定，默认梦幻钢琴）
 const create = {
   chordIdx: 0,            // C-F-G-Am 轮换游标
   recording: false,
@@ -123,6 +264,17 @@ const freeState = { cheerIdx: 0 };
 
 function clamp(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
 function audioTimeNow() { return audio.ctx ? audio.ctx.currentTime : 0; }
+
+/* 音符判定专用时钟：AudioContext.currentTime（与 startSong 调度的 audioTime 同源）；
+ * 音频不可用时兜底 performance.now，保证键盘路径可玩（勿混用两种时钟） */
+function noteClock() {
+  return audio.ctx ? audio.ctx.currentTime : performance.now() / 1000;
+}
+
+/* 连击加成：≥10 ×1.2，≥30 ×1.5 */
+function comboMult(combo) {
+  return combo >= 30 ? 1.5 : combo >= 10 ? 1.2 : 1;
+}
 
 /* 手腕归一化 y（0 顶 1 底）→ 音高序号：手越高音越高 */
 function wristToPentaIdx(y) {
@@ -216,9 +368,9 @@ function onPoseResults(res) {
 function handleAction(pi, lane, lm) {
   if (S.state !== 'PLAYING') return;
   if (S.mode === 'rhythm') {
-    laneFx(lane);
-    laneSound(lane);
-    djJudge(pi, lane);
+    laneFx(lane);        // 动作本身的灯光反馈（命中音符另有 noteHit 爆闪）
+    laneSound(lane);     // 空按也有打击音（自由打拍感），命中音由曲目本身承担
+    djJudgeAction(pi, lane);
   } else if (S.mode === 'instrument') {
     createAction(pi, lane, lm);
   } else {
@@ -228,76 +380,139 @@ function handleAction(pi, lane, lm) {
 
 /* ============================== DJ 节奏模式 ============================== */
 
-function startDJ() {
+function startDJ(song) {
   pendingBeats = [];
   pulse = 0;
+  dj.notes = [];
+  dj.noteSeq = 0;
+  dj.maxPossible = 0;
   dj.scores = [0, 0];
   dj.combos = [0, 0];
   dj.maxCombos = [0, 0];
-  dj.target = null;
+  dj.clearAt = [0, 0];
   dj.startAt = 0;
-  dj.wallStart = performance.now();
-  dj.retryAt = 0;
+  dj.fbNext = 0;
+  dj.fbStep = 0;
+  dj.songEndAt = 0;
+  dj.ended = false;
+  if (song) dj.song = song;
+  stage.clearNotes();
 
-  const style = STYLES[dj.styleIdx % STYLES.length];   // 曲风轮换
-  dj.styleIdx = (dj.styleIdx + 1) % STYLES.length;
-  const bpm = 112 + Math.floor(Math.random() * 17);    // 112..128
-
-  let trackOk = true;
+  let ok = true;
   try {
-    audio.startTrack(style, bpm, { onBeat: onDJBeat });
-    dj.startAt = audio.ctx.currentTime;
+    audio.startSong(dj.song, { onBeat: onDJBeat, onNote: onDJNote });
   } catch (err) {
-    trackOk = false;
-    console.warn('[game] 音序器启动失败：', err);
+    ok = false;
+    console.warn('[game] startSong 失败，切换本地兜底节奏：', err);
+  }
+  dj.audioOk = ok;
+  dj.startAt = noteClock();
+  if (!ok) {
+    dj.fbNext = dj.startAt + 1.0;   // 兜底流 1 秒后开跑
   }
 
+  const diff = Math.min(3, Math.max(1, (dj.song && dj.song.difficulty) || 1));
   setHud({
     p1Score: 0, p1Combo: 0,
     p2Score: S.players === 2 ? 0 : null, p2Combo: S.players === 2 ? 0 : undefined,
-    trackInfo: style.toUpperCase() + ' · ' + bpm + ' BPM' + (trackOk ? '' : ' · 无音频'),
+    trackInfo: ((dj.song && dj.song.name) || 'UNTITLED') + ' · ' + ((dj.song && dj.song.bpm) || '--')
+      + ' BPM · ' + '★'.repeat(diff) + (ok ? '' : ' · 无音频兜底'),
   });
-  showJudge('跟拍开打：左臂 / 右臂 / 双手 / 下蹲！', '#00e5ff');
+  showJudge('接住下落音符：左 / 右 / 双手 · 下蹲清屏！', '#00e5ff');
 }
 
-/* 每拍回调（音频调度线程提前 ~0.1s 触发）：排入视觉脉冲 + 生成判定目标 */
+/* 每拍回调（音频调度线程提前 ~0.1s 触发）：只驱动视觉节拍脉冲，判定由音符负责 */
 function onDJBeat(beatIndex, barIndex, audioTime) {
   if (S.state !== 'PLAYING' || S.mode !== 'rhythm') return;
   pendingBeats.push(audioTime);
-  const lane = TARGET_SEQ[beatIndex % TARGET_SEQ.length];
-  /* 旧拍补记 MISS：新 target 替换前，未判定玩家直接断连击
-   *（128BPM 时 djTick 的过期窗口仅约 69ms，低帧率下渲染帧可能来不及记） */
-  const old = dj.target;
-  if (old) {
-    let missAny = false;
-    for (let pi = 0; pi < S.players; pi++) {
-      if (!old.judged[pi]) {
-        old.judged[pi] = true;
-        dj.combos[pi] = 0;
-        missAny = true;
-      }
-    }
-    if (missAny) showJudge('MISS', '#ff5470');
-  }
-  dj.target = { lane, audioTime, judged: [false, false] };
-  showJudge(TARGET_LABEL[lane], '#ffd166');   // 目标提示（提前显示正好预备）
 }
 
-/* 纯判定（不含视觉/音效反馈，供姿态与键盘双路复用） */
-function djJudge(pi, lane) {
-  const tgt = dj.target;
-  if (!tgt || tgt.judged[pi] || tgt.lane !== lane) return;
-  const diff = Math.abs(audioTimeNow() - tgt.audioTime);
-  let base = 0, label = '', color = '#ffffff';
-  if (diff <= PERFECT_WIN) { base = 100; label = 'PERFECT'; color = '#ffd700'; }
-  else if (diff <= GOOD_WIN) { base = 50; label = 'GOOD'; color = '#00e5ff'; }
-  if (!base) return;   // 窗口外动作：不奖不罚，等窗口结束统一记 MISS
-  tgt.judged[pi] = true;
+/* startSong 提前排程回调：收到即生成音符开始飞行。
+ * 飞行进度由 hitTime 计算，与回调到达时刻无关；飞行时长取
+ * min(NOTE_TRAVEL, hitTime - 收到时刻)：Taylor 提前量不足 2s 时
+ * 音画仍同步（飞行变短），提前 ≥2.2s 时完整 2 秒飞行 */
+function onDJNote(n) {
+  if (S.state !== 'PLAYING' || S.mode !== 'rhythm') return;
+  if (!n || !isFinite(n.audioTime)) return;
+  const lane = Math.min(3, Math.max(0, Math.round(Number(n.lane) || 0)));
+  const travel = Math.min(NOTE_TRAVEL, Math.max(0.12, Number(n.audioTime) - noteClock()));
+  dj.notes.push({
+    uid: ++dj.noteSeq,
+    lane,
+    hitTime: Number(n.audioTime),
+    travel,
+    dur: Math.max(0, Number(n.dur) || 0),
+    judged: [false, false],   // 双人独立判定标记
+    grade: [null, null],      // 每玩家 grade（miss 亦记，用于视觉态）
+    doneAt: null,             // 全员判定时刻（淡出删除计时用）
+  });
+  dj.maxPossible += SCORE_BASE.perfect * 1.5;   // 满分估算：按加成上界累计
+}
+
+/* 玩家动作 → 判定分发（姿态与键盘共用）。action: 'left'|'right'|'both'|'squat'。
+ * 空按（无音符在窗口）不惩罚：findHittable 找不到就不做任何事 */
+function djJudgeAction(pi, action) {
+  if (S.state !== 'PLAYING' || S.mode !== 'rhythm') return;
+  if (action === 'squat') { djClearSkill(pi); return; }
+  const now = noteClock();
+  const lanes = ACT_LANES[action] || [];
+  for (const ln of lanes) {
+    const note = findHittable(pi, ln, now);
+    if (!note) continue;
+    const grade = gradeForDiff(Math.abs(now - note.hitTime));
+    applyGrade(pi, note, grade);
+    stage.noteHit(note.lane, grade);
+    showJudge((S.players === 2 ? 'P' + (pi + 1) + ' ' : '') + JUDGE_LABEL[grade], JUDGE_COLOR[grade]);
+  }
+}
+
+/* 在判定窗口内找玩家 pi 未判定、lane 匹配、离 hitTime 最近的音符；无则返回 null。
+ * 早按 ≤ WIN_GOOD（0.32s）；晚按 ≤ MISS_GRACE（0.25s，与 MISS 补记时刻一致，
+ * 因此不存在“已判 MISS 后还能 GOOD”的矛盾区 */
+function findHittable(pi, lane, now) {
+  let best = null, bestDiff = Infinity;
+  for (const n of dj.notes) {
+    if (n.judged[pi] || n.lane !== lane) continue;
+    const diff = now - n.hitTime;
+    if (diff < -WIN_GOOD || diff > MISS_GRACE) continue;
+    const ad = Math.abs(diff);
+    if (ad < bestDiff) { bestDiff = ad; best = n; }
+  }
+  return best;
+}
+
+function gradeForDiff(ad) {
+  return ad <= WIN_PERFECT ? 'perfect' : ad <= WIN_GREAT ? 'great' : 'good';
+}
+
+/* 计分 + 连击推进（判定文案 / 视觉反馈由调用方负责） */
+function applyGrade(pi, note, grade) {
+  note.judged[pi] = true;
+  note.grade[pi] = grade;
   const combo = ++dj.combos[pi];
   dj.maxCombos[pi] = Math.max(dj.maxCombos[pi], combo);
-  dj.scores[pi] += Math.round(base * (combo >= 10 ? 1.5 : 1));   // 连击 ≥10 得分 ×1.5
-  showJudge((S.players === 2 ? 'P' + (pi + 1) + ' ' : '') + label, color);
+  dj.scores[pi] += Math.round(SCORE_BASE[grade] * comboMult(combo));
   updateScoresHud();
+}
+
+/* 清屏技（下蹲 / L）：清除未来 2 秒内该玩家所有未判音符记 GREAT，冷却 5 秒。
+ * 没清到任何音符时不消耗冷却（等同普通动作，不惩罚） */
+function djClearSkill(pi) {
+  const now = noteClock();
+  if (now - dj.clearAt[pi] < CLEAR_CD) return;
+  let cleared = 0;
+  for (const n of dj.notes) {
+    if (n.judged[pi]) continue;
+    if (n.hitTime < now || n.hitTime > now + CLEAR_WINDOW) continue;
+    applyGrade(pi, n, 'great');
+    stage.noteHit(n.lane, 'great');
+    cleared++;
+  }
+  if (!cleared) return;
+  dj.clearAt[pi] = now;
+  stage.flash('squat');
+  stage.spawnBurst('squat');
+  showJudge((S.players === 2 ? 'P' + (pi + 1) + ' ' : '') + '清屏技 ×' + cleared + '！', '#ffcf5c');
 }
 
 function updateScoresHud() {
@@ -308,52 +523,92 @@ function updateScoresHud() {
   });
 }
 
-/* DJ 逐帧逻辑：窗口过期的拍记 MISS 断连击；曲目满 90 秒进结算 */
+/* DJ 逐帧：MISS 补记 / 兜底音符流 / 音符视觉喂数 / 结算检测 */
 function djTick() {
-  const tgt = dj.target;
-  if (tgt) {
-    const t = audioTimeNow();
-    let missAny = false;
+  const now = noteClock();
+
+  /* 1. MISS 补记：越过判定线 0.25s 仍未判 → 断连击（晚按侧窗口已截断，无矛盾区） */
+  let missAny = false;
+  for (const n of dj.notes) {
+    if (now <= n.hitTime + MISS_GRACE) continue;
     for (let pi = 0; pi < S.players; pi++) {
-      if (!tgt.judged[pi] && t > tgt.audioTime + GOOD_WIN) {
-        tgt.judged[pi] = true;
+      if (!n.judged[pi]) {
+        n.judged[pi] = true;
+        n.grade[pi] = 'miss';
         dj.combos[pi] = 0;
         missAny = true;
       }
     }
-    if (missAny) showJudge('MISS', '#ff5470');
   }
-  if (audio.ctx && dj.startAt > 0) {
-    if (audio.ctx.currentTime - dj.startAt >= DJ_DURATION) {
-      endDJ();
-      return;
+  if (missAny) showJudge('MISS', JUDGE_COLOR.miss);
+
+  /* 2. 音频不可用兜底：本地假时钟均匀生成四 lane 音符流，键盘路径照常可玩
+   * （提前 NOTE_TRAVEL+0.2s 生成，兜底音符也享完整 2 秒飞行） */
+  if (!dj.audioOk && dj.fbNext > 0) {
+    while (dj.fbNext < now + NOTE_TRAVEL + 0.2 && dj.fbNext - dj.startAt <= FB_LEN) {
+      dj.notes.push({
+        uid: ++dj.noteSeq,
+        lane: dj.fbStep % 4,
+        hitTime: dj.fbNext,
+        travel: NOTE_TRAVEL,
+        dur: 0,
+        judged: [false, false],
+        grade: [null, null],
+        doneAt: null,
+      });
+      dj.maxPossible += SCORE_BASE.perfect * 1.5;
+      dj.fbNext += 60 / FB_BPM;   // 四分音符一颗
+      dj.fbStep++;
     }
-    /* 曲目中断自愈：背景曲意外停止（音序器 running=false）且未到结算点时，
-     * 自动换下一风格续播，保证判定目标持续生成直到 90 秒结算。
-     * startTrack 内部会先 stopTrack 防叠加，且不重置 ctx.currentTime，
-     * 结算时钟 dj.startAt 不受影响（90 秒结算逻辑保持不变）。 */
-    const info = audio.getUserTrackInfo();
-    if (!info.running && performance.now() >= dj.retryAt) {
-      dj.retryAt = performance.now() + 1000;   // 启动报错时 1s 冷却，防每帧重试刷屏
-      try {
-        const style = STYLES[dj.styleIdx % STYLES.length];
-        dj.styleIdx = (dj.styleIdx + 1) % STYLES.length;
-        const bpm = 112 + Math.floor(Math.random() * 17);   // 续播 BPM 微调 112..128
-        const trk = audio.startTrack(style, bpm, { onBeat: onDJBeat });
-        setHud({ trackInfo: trk.style.toUpperCase() + ' · ' + trk.bpm + ' BPM · 续播' });
-        showJudge('下一首：' + trk.style.toUpperCase() + ' ' + trk.bpm + ' BPM', '#ffd166');
-      } catch (err) {
-        console.warn('[game] DJ 续播失败：', err);
+  }
+
+  /* 3. 音符视觉：算好进度/状态喂给 3D 舞台（p=1 到判定线，判定后冻结在 1） */
+  stage.setNotes(now, dj.notes.map((n) => {
+    const done = n.judged[0] && (S.players === 1 || n.judged[1]);
+    let state = 'fly', grade = null;
+    if (done) {
+      for (let pi = 0; pi < S.players; pi++) {
+        const g = n.grade[pi];
+        if (g && g !== 'miss' && (!grade || GRADE_RANK[g] < GRADE_RANK[grade])) grade = g;
+      }
+      state = grade ? 'hit' : 'miss';   // 全 miss → 灰淡；有命中 → 按最好 grade 爆裂
+    }
+    return {
+      uid: n.uid, lane: n.lane, dur: n.dur, state, grade,
+      p: done ? 1 : clamp(1 - (n.hitTime - now) / (n.travel || NOTE_TRAVEL), 0, 1.15),
+    };
+  }));
+
+  /* 4. 清理已完成淡出的音符（判定完成后 0.35s 从数组移除，淡出动画由 stage3d 接管） */
+  for (let i = dj.notes.length - 1; i >= 0; i--) {
+    const n = dj.notes[i];
+    if (!(n.judged[0] && (S.players === 1 || n.judged[1]))) continue;
+    if (n.doneAt == null) n.doneAt = now;
+    else if (now - n.doneAt > 0.35) dj.notes.splice(i, 1);
+  }
+
+  /* 5. 结算：曲目播完（startSong 曲尾自动停 → running=false；ESC 的 stopTrack 会先
+   *    把状态切离 PLAYING，不会走到这里）且全部音符判定完毕 → 结算屏。
+   *    安全网：曲停 5 秒仍未清完（异常中断）强制结算 */
+  if (dj.startAt > 0 && !dj.ended) {
+    const songDone = dj.audioOk
+      ? (!audio.getUserTrackInfo().running && now - dj.startAt > 1.5)
+      : (now - dj.startAt > FB_LEN + 1.0);
+    if (songDone) {
+      if (!dj.songEndAt) dj.songEndAt = now;
+      if (dj.notes.length === 0 || now - dj.songEndAt > 5) {
+        endDJ();
+        return;
       }
     }
-  } else if (performance.now() - dj.wallStart >= DJ_DURATION * 1000) {
-    endDJ();
   }
 }
 
 function endDJ() {
+  dj.ended = true;
   audio.stopTrack();
-  dj.target = null;
+  dj.notes = [];
+  stage.clearNotes();
   S.state = 'RESULT';
   showResult();
 }
@@ -362,8 +617,11 @@ function endDJ() {
 
 let resultEl = null;
 
+/* 评级：按本曲满分估算比例（S≥55% / A≥40% / B≥25%，其余 C） */
 function gradeOf(score) {
-  return score >= 16000 ? 'S' : score >= 10500 ? 'A' : score >= 5000 ? 'B' : 'C';
+  const full = Math.max(1, dj.maxPossible);
+  const r = score / full;
+  return r >= 0.55 ? 'S' : r >= 0.40 ? 'A' : r >= 0.25 ? 'B' : 'C';
 }
 
 function ensureResultStyle() {
@@ -407,17 +665,33 @@ function ensureResultStyle() {
   document.head.appendChild(st);
 }
 
+/* 历史最高分（按曲子分档）：mwdj_best_v1 = { [songId]: {score, combo, grade} }。
+ * 旧格式（纯数字/解析失败）直接重置；读写全程 try/catch（隐私模式可能抛错） */
+function loadBestMap() {
+  try {
+    const raw = localStorage.getItem(BEST_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+    if (raw != null) localStorage.removeItem(BEST_KEY);   // 旧数字格式：重置
+  } catch (e) { /* 忽略 */ }
+  return {};
+}
+
 function showResult() {
   ensureResultStyle();
   hideResult();
 
-  /* 最高分：双人取两人较高者；读写 localStorage 全程 try/catch（隐私模式可能抛错） */
-  const top = Math.max(dj.scores[0], dj.scores[1]);
-  let prevBest = 0;
-  try { prevBest = Number(localStorage.getItem(BEST_KEY)) || 0; } catch (e) { /* 忽略 */ }
+  /* 本曲最高分：双人取两人较高者入库 */
+  const songId = (dj.song && dj.song.id) || 'unknown';
+  const top = Math.max(dj.scores[0], S.players === 2 ? dj.scores[1] : 0);
+  const topPi = (S.players === 2 && dj.scores[1] > dj.scores[0]) ? 1 : 0;
+  const bestMap = loadBestMap();
+  const prev = bestMap[songId] || null;
+  const prevBest = prev ? (prev.score || 0) : 0;
   const isNew = top > prevBest;
   if (isNew) {
-    try { localStorage.setItem(BEST_KEY, String(top)); } catch (e) { /* 忽略 */ }
+    bestMap[songId] = { score: top, combo: dj.maxCombos[topPi], grade: gradeOf(top) };
+    try { localStorage.setItem(BEST_KEY, JSON.stringify(bestMap)); } catch (e) { /* 忽略 */ }
   }
   const best = Math.max(prevBest, top);
 
@@ -439,7 +713,7 @@ function showResult() {
       '<h2 class="r-title">本局结算</h2>' +
       rowHtml(0) +
       (S.players === 2 ? rowHtml(1) : '') +
-      '<p class="r-best">历史最高分 ' + best + (isNew ? '<b class="r-new">新纪录！</b>' : '') + '</p>' +
+      '<p class="r-best">本曲最高 ' + best + ' 分' + (isNew ? '<b class="r-new">新纪录！</b>' : '') + '</p>' +
       '<div class="r-btns">' +
         '<button class="r-btn r-again" type="button">再来一局</button>' +
         '<button class="r-btn r-menu" type="button">返回菜单</button>' +
@@ -450,7 +724,7 @@ function showResult() {
   el.querySelector('.r-again').addEventListener('click', () => {
     hideResult();
     S.state = 'PLAYING';
-    startDJ();
+    startDJ(dj.song);   // 同曲重开
   });
   el.querySelector('.r-menu').addEventListener('click', backToMenu);
 }
@@ -465,27 +739,28 @@ function hideResult() {
 /* ============================== 乐器创作模式 ============================== */
 
 function startCreate() {
+  const pack = INSTRUMENTS[instrumentIdx] || INSTRUMENTS[0];
   lastTrackInfo = '';
   setHud({
     p1Score: 0, p1Combo: 0,
     p2Score: S.players === 2 ? 0 : null, p2Combo: S.players === 2 ? 0 : undefined,
-    trackInfo: 'LIVE JAM · 身体即乐器',
+    trackInfo: pack.name + ' · LIVE JAM',
   });
-  showJudge('左臂弹琴 · 右手扫弦 · 下蹲和弦 · 双手举镲', '#ffcf5c');
+  showJudge('左臂音阶 · 右手扫弦 · 下蹲和弦 · 双手彩蛋', '#ffcf5c');
 }
 
 /* 创作模式姿态动作分发 */
 function createAction(pi, lane, lm) {
   if (lane === 'left') {
-    /* 左臂高度映射 C 大调五声音阶（挥臂即弹琴，冷却 200ms/侧） */
+    /* 左臂高度映射 C 大调五声音阶（音色随当前乐器包，冷却 200ms/侧） */
     const lw = lm && lm[15];
     const y = lw && lw.v >= 0.1 ? lw.y : 0.5;
     jam('piano', wristToPentaIdx(y));
   } else if (lane === 'both') {
-    /* 双手同举：镲片 + 灯光爆闪 */
+    /* 双手同举：彩蛋音 + 灯光爆闪 */
     jam('cymbal', -1);
   } else if (lane === 'squat') {
-    /* 下蹲：和弦 C-F-G-Am 按蹲的次数轮换 + 底鼓 */
+    /* 下蹲：和弦按蹲的次数轮换（进行随乐器包）+ 底鼓 */
     const ci = create.chordIdx;
     create.chordIdx = (create.chordIdx + 1) % CHORDS.length;
     jam('chord', ci);
@@ -493,7 +768,9 @@ function createAction(pi, lane, lm) {
   /* lane === 'right'：右手高举保持不发声（吉他由"快速下压"事件触发） */
 }
 
-/* 创作模式统一发声入口：发声 + 视觉 + 录制记录 */
+/* 创作模式统一发声入口：按当前乐器包发声 + 视觉 + 录制记录。
+ * kind → 包方法映射：'piano'→scale / 'guitar'→strum / 'chord'→chord / 'cymbal'→egg；
+ * 录制流只记 kind/data，回放（jamSound）自动套用回放时所选包的音色 */
 function jam(kind, data) {
   if (S.state !== 'PLAYING' || S.mode !== 'instrument') return;
   jamSound(kind, data);
@@ -507,17 +784,17 @@ function jam(kind, data) {
 }
 
 function jamSound(kind, data) {
+  const pack = INSTRUMENTS[instrumentIdx] || INSTRUMENTS[0];
   const t = audioTimeNow();
   if (kind === 'piano') {
-    audio.playPiano(noteToFreq(PENTA[data] || 'C4'), t, 0.5);
+    pack.scale(Number(data) || 0, t);      // 音阶（五声音阶 8 音序号）
   } else if (kind === 'guitar') {
-    audio.playGuitar(noteToFreq(GTR_NOTES[data] || 'A2'), t);
+    pack.strum(Number(data) || 0, t);      // 扫弦（吉他音域序号）
   } else if (kind === 'chord') {
-    const ch = CHORDS[data] || CHORDS[0];
-    audio.playChord(ch.map(noteToFreq), t, 1.0);
-    audio.playKick(t);
+    pack.chord(Number(data) || 0, t);      // 和弦（轮换序号，进行随乐器包）
+    audio.playKick(t);                     // 叠一脚底鼓（各包一致）
   } else {
-    audio.playCymbal(t);
+    pack.egg(t);                           // 双手同举彩蛋音
   }
 }
 
@@ -528,14 +805,18 @@ function jamFx(kind) {
   else { stage.flash('both'); stage.spawnBurst('both'); }
 }
 
-/* 录制 / 回放：R 开始 8 秒录制；再按 R 立即结束并回放；回放可叠加 */
+/* 录制 / 回放：R 开启 8 秒录制（仅 recEvents 为空时）；录制中再按 R 立即结束并回放；
+ * 录制自然结束后（已有内容且未在录）再按 R 回放而非覆盖新录制；
+ * 事件流只记 kind/data，回放音色跟随回放时所选乐器包 */
 function toggleRecord() {
   if (S.state !== 'PLAYING' || S.mode !== 'instrument') return;
   if (create.recording) {
     stopRecording();
     playRecording();
+  } else if (create.recEvents.length) {
+    playRecording();          // 已有录制内容：R = 回放
   } else {
-    startRecording();
+    startRecording();         // 无录制内容：R = 开启录制
   }
 }
 
@@ -582,13 +863,14 @@ function clearJamTimers() {
 
 /* 创作模式逐帧：HUD 提示录制状态（仅在文本变化时写 DOM） */
 function createTick() {
+  const nm = (INSTRUMENTS[instrumentIdx] || INSTRUMENTS[0]).name;
   let info;
   if (create.recording) {
-    info = 'LIVE JAM · 录制中 ' + ((performance.now() - create.recStart) / 1000).toFixed(1) + 's';
+    info = nm + ' · LIVE JAM · 录制中 ' + ((performance.now() - create.recStart) / 1000).toFixed(1) + 's';
   } else if (create.recEvents.length) {
-    info = 'LIVE JAM · 已录 ' + create.recEvents.length + ' 个动作（R 回放）';
+    info = nm + ' · LIVE JAM · 已录 ' + create.recEvents.length + ' 个动作（R 回放）';
   } else {
-    info = 'LIVE JAM · 身体即乐器';
+    info = nm + ' · LIVE JAM · 身体即乐器';
   }
   if (info !== lastTrackInfo) {
     lastTrackInfo = info;
@@ -638,6 +920,47 @@ function onModeStart(mode, players) {
   } catch (err) {
     console.warn('[game] 音频初始化失败：', err);
     showJudge('音频不可用：' + ((err && err.message) || err), '#ff2bd6');
+  }
+  /* DJ 模式：先进选曲面板（曲库按难度排序），选中后再引导/开局；ESC/返回回菜单 */
+  if (mode === 'rhythm') {
+    S.state = 'PICKING';
+    showSongPicker(songsByDifficulty(), {
+      onPick: (song) => {
+        hideSongPicker();
+        dj.song = song;
+        if (!guideSeen.rhythm) {
+          guideSeen.rhythm = true;
+          S.state = 'GUIDE';
+          showGuide();
+          setGuideDismissed(() => beginMode('rhythm', players));
+        } else {
+          beginMode('rhythm', players);
+        }
+      },
+      onBack: () => { hideSongPicker(); backToMenu(); },
+    });
+    return;
+  }
+  /* 创作模式：先进乐器选择面板（上次选择默认高亮），选中后引导/开局；ESC/返回回菜单 */
+  if (mode === 'instrument') {
+    S.state = 'PICKING';
+    showInstrumentPicker(INSTRUMENTS, loadInstrumentId(), {
+      onPick: (pack) => {
+        hideInstrumentPicker();
+        instrumentIdx = Math.max(0, INSTRUMENTS.indexOf(pack));
+        saveInstrumentId(pack.id);
+        if (!guideSeen.instrument) {
+          guideSeen.instrument = true;
+          S.state = 'GUIDE';
+          showGuide();
+          setGuideDismissed(() => beginMode('instrument', players));
+        } else {
+          beginMode('instrument', players);
+        }
+      },
+      onBack: () => { hideInstrumentPicker(); backToMenu(); },
+    });
+    return;
   }
   /* 引导弹窗：每种模式仅首次 */
   if (!guideSeen[mode]) {
@@ -703,7 +1026,7 @@ async function beginMode(mode, players) {
   motion[0] = mkMotion();
   motion[1] = mkMotion();
 
-  if (mode === 'rhythm') startDJ();
+  if (mode === 'rhythm') startDJ(dj.song);
   else if (mode === 'instrument') startCreate();
   else startFree();
 
@@ -726,9 +1049,13 @@ function backToMenu() {
   audio.stopTrack();
   hideGuide();
   hideResult();
+  hideSongPicker();         // 选曲面板可能开着（ESC / 面板返回按钮）
+  hideInstrumentPicker();   // 乐器选择面板同理
   hideLoading();   // 加载期间 ESC：遮罩可能仍显示，回菜单必须收起
   clearJamTimers();
-  dj.target = null;
+  dj.notes = [];
+  dj.ended = false;
+  stage.clearNotes();
   pendingBeats = [];
   pulse = 0;
   S.state = 'MENU';
@@ -752,7 +1079,7 @@ document.addEventListener('keydown', (e) => {
   }
   if (S.state !== 'PLAYING') return;
 
-  /* 创作模式键盘：J=钢琴随机音 K=吉他 L=和弦 I=镲 */
+  /* 创作模式键盘：J=音阶 K=扫弦 L=和弦 I=彩蛋（均走当前乐器包音色） */
   if (S.mode === 'instrument') {
     const kb = { KeyJ: 'piano', KeyK: 'guitar', KeyL: 'chord', KeyI: 'cymbal' }[e.code];
     if (!kb) return;
@@ -770,16 +1097,16 @@ document.addEventListener('keydown', (e) => {
     return;
   }
 
-  /* DJ / 自由模式键盘：J=左 K=右 L=蹲 I=双手（键盘无法区分玩家，双人时判定双方） */
-  const lane = { KeyJ: 'left', KeyK: 'right', KeyL: 'squat', KeyI: 'both' }[e.code];
-  if (!lane) return;
+  /* DJ / 自由模式键盘：J=左 K=右 L=蹲(清屏技) I=双手（键盘无法区分玩家，双人时判定双方） */
+  const action = { KeyJ: 'left', KeyK: 'right', KeyL: 'squat', KeyI: 'both' }[e.code];
+  if (!action) return;
   if (S.mode === 'rhythm') {
-    laneFx(lane);
-    laneSound(lane);
-    djJudge(0, lane);
-    if (S.players === 2) djJudge(1, lane);
+    laneFx(action);
+    laneSound(action);
+    djJudgeAction(0, action);
+    if (S.players === 2) djJudgeAction(1, action);
   } else {
-    freeAction(0, lane);
+    freeAction(0, action);
   }
 });
 

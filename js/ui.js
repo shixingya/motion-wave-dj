@@ -2,7 +2,7 @@
  * MOTION WAVE DJ · UI 层（js/ui.js）
  * ---------------------------------------------------------------------
  * 职责：菜单渲染 / HUD 更新 / 中央判定 / 画中画骨架绘制 / 键盘降级 /
- *       动作引导 / 调试面板 / 加载遮罩。
+ *       动作引导 / 选择面板（DJ 选曲 · 创作选乐器）/ 调试面板 / 加载遮罩。
  * 不依赖 game.js / stage3d.js / audio.js —— 纯 UI 能力，由入口或 game.js 调度。
  * ===================================================================== */
 
@@ -51,7 +51,7 @@ function renderMenu() {
         <button class="mode-card mc-rhythm" data-mode="rhythm" type="button">
           <span class="mode-icon">🎛️</span>
           <span class="mode-name">DJ 节奏模式</span>
-          <span class="mode-desc">跟拍挥手打点，冲击连击高分</span>
+          <span class="mode-desc">接住下落音符，冲击连击高分</span>
         </button>
         <button class="mode-card mc-instrument" data-mode="instrument" type="button">
           <span class="mode-icon">🎹</span>
@@ -241,6 +241,165 @@ export function toggleDebug(extra) {
 }
 
 /* =====================================================================
+ * 选择面板（DJ 选曲 / 创作选乐器）：动态注入样式与 DOM，风格与结算卡一致。
+ * 不依赖 tracks.js / game.js —— 数据由 game.js 整理后作为参数传入；
+ * 同一时刻只存在一个面板（选曲与选乐器互斥），隐藏接口均可安全重复调用
+ * ===================================================================== */
+let pickerEl = null;
+
+function ensurePickerStyle() {
+  if (document.getElementById('mwdjPickerStyle')) return;
+  const st = document.createElement('style');
+  st.id = 'mwdjPickerStyle';
+  st.textContent = [
+    '#songPicker,#instrumentPicker{position:fixed;inset:0;z-index:58;display:flex;align-items:center;justify-content:center;',
+    'background:rgba(3,0,10,.78);backdrop-filter:blur(8px)}',
+    '.sp-card{width:min(640px,92vw);max-height:90vh;overflow-y:auto;padding:30px 26px 22px;border-radius:24px;',
+    'background:linear-gradient(180deg,rgba(16,8,38,.97),rgba(8,3,22,.97));',
+    'border:1.5px solid rgba(0,229,255,.4);',
+    'box-shadow:0 0 30px rgba(0,229,255,.18),0 0 70px rgba(255,43,214,.12),0 30px 80px rgba(0,0,0,.6);',
+    'animation:spIn .28s cubic-bezier(.2,1.3,.4,1)}',
+    '@keyframes spIn{from{transform:scale(.9);opacity:0}to{transform:scale(1);opacity:1}}',
+    '.sp-title{font-size:1.5rem;font-weight:900;letter-spacing:.3em;text-indent:.3em;text-align:center;margin-bottom:8px;',
+    'background:linear-gradient(92deg,#00e5ff,#ff2bd6);-webkit-background-clip:text;background-clip:text;color:transparent}',
+    '.sp-sub{text-align:center;font-size:.9rem;letter-spacing:.1em;color:rgba(233,226,255,.6);margin-bottom:18px}',
+    '.sp-list{margin-bottom:16px}',
+    '.sp-row{display:flex;align-items:center;gap:14px;width:100%;padding:13px 16px;margin-bottom:10px;',
+    'border-radius:14px;text-align:left;cursor:pointer;font-family:inherit;color:#f4f1ff;',
+    'background:rgba(255,255,255,.045);border:1px solid rgba(123,43,255,.28);',
+    'transition:border-color .15s ease,box-shadow .15s ease,transform .1s ease}',
+    '.sp-row:hover,.sp-row:focus-visible{border-color:rgba(0,229,255,.6);',
+    'box-shadow:0 0 18px rgba(0,229,255,.25);transform:translateY(-2px);outline:none}',
+    '.sp-row:active{transform:scale(.98)}',
+    '.sp-row.cur{border-color:rgba(255,201,60,.7);box-shadow:0 0 16px rgba(255,201,60,.25)}',
+    '.sp-row.cur::after{content:"使用中";font-size:.72rem;font-weight:800;color:#ffc93c;',
+    'letter-spacing:.12em;white-space:nowrap}',
+    '.sp-main{flex:1;min-width:0;display:flex;flex-direction:column;gap:5px;align-items:flex-start}',
+    '.sp-name{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;',
+    'font-size:1.08rem;font-weight:800;letter-spacing:.04em}',
+    '.sp-style{font-size:.78rem;font-weight:700;letter-spacing:.14em;color:#00e5ff;text-transform:uppercase;',
+    'border:1px solid rgba(0,229,255,.4);border-radius:999px;padding:2px 10px}',
+    '.sp-desc{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;',
+    'font-size:.8rem;font-weight:600;color:rgba(233,226,255,.58);letter-spacing:.02em}',
+    '.sp-bpm{font-family:"Segoe UI","Arial Black",Impact,sans-serif;font-size:.92rem;font-weight:700;',
+    'color:rgba(233,226,255,.72);white-space:nowrap}',
+    '.sp-stars{color:#ffc93c;font-size:1.02rem;letter-spacing:.1em;text-shadow:0 0 10px rgba(255,201,60,.45)}',
+    '.sp-len{font-size:.85rem;color:rgba(233,226,255,.55);white-space:nowrap}',
+    '.sp-empty{text-align:center;padding:20px 0;color:rgba(233,226,255,.55);letter-spacing:.1em}',
+    '.sp-back{width:100%;padding:14px 0;border:none;border-radius:14px;font-family:inherit;font-size:1.05rem;',
+    'font-weight:900;letter-spacing:.16em;text-indent:.16em;cursor:pointer;color:#f4f1ff;',
+    'background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.25);transition:filter .15s ease}',
+    '.sp-back:hover{filter:brightness(1.15)}',
+    '.sp-back:active{transform:scale(.98)}',
+    '@media (max-width:640px){.sp-card{padding:20px 14px 16px}.sp-row{padding:11px 12px}.sp-bpm{display:none}}'
+  ].join('');
+  document.head.appendChild(st);
+}
+
+/* 曲名等字段经 HTML 转义后再插入（曲库数据来自代码，防一手不必须但更稳） */
+function _esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+
+/* 公共面板骨架：overlay + 标题/副标题 + 行列表 + 返回按钮。
+ * rowsHtml 由调用方拼好，onRow(行下标) / onBack 由调用方实现业务 */
+function _renderPicker(id, title, sub, rowsHtml, { onRow, onBack, emptyText } = {}) {
+  ensurePickerStyle();
+  hidePicker();
+  const el = document.createElement('div');
+  el.id = id;
+  el.innerHTML =
+    '<div class="sp-card">' +
+      '<h2 class="sp-title">' + _esc(title) + '</h2>' +
+      '<p class="sp-sub">' + _esc(sub) + '</p>' +
+      '<div class="sp-list">' + (rowsHtml || '<p class="sp-empty">' + _esc(emptyText || '暂无可选项') + '</p>') + '</div>' +
+      '<button class="sp-back" type="button">返回</button>' +
+    '</div>';
+  document.body.appendChild(el);
+  pickerEl = el;
+  el.querySelectorAll('.sp-row').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      if (typeof onRow === 'function') onRow(Number(btn.dataset.i));
+    });
+  });
+  const back = el.querySelector('.sp-back');
+  if (back) {
+    back.addEventListener('click', () => {
+      if (typeof onBack === 'function') onBack();
+    });
+  }
+}
+
+/* 销毁当前面板（选曲 / 选乐器共用） */
+function hidePicker() {
+  if (pickerEl) {
+    pickerEl.remove();
+    pickerEl = null;
+  }
+}
+
+/**
+ * 显示选曲面板。
+ * @param {Array} songs 已按难度排序的曲库（每首 { id, name, style, bpm, difficulty, lengthBeats }）
+ * @param {{onPick?:Function, onBack?:Function}} cb 选中 / 返回回调
+ */
+export function showSongPicker(songs, { onPick, onBack } = {}) {
+  const list = Array.isArray(songs) ? songs : [];
+  const rows = list.map((s, i) => {
+    const diff = Math.min(3, Math.max(1, (s && s.difficulty) || 1));
+    const sec = Math.round(((s && s.lengthBeats) || 0) / Math.max(1, (s && s.bpm) || 120) * 60);
+    const mm = Math.floor(sec / 60);
+    const ss = String(sec % 60).padStart(2, '0');
+    return '<button class="sp-row" type="button" data-i="' + i + '">' +
+      '<span class="sp-main"><span class="sp-name">' + _esc(s.name) + '</span>' +
+      '<span class="sp-style">' + _esc(s.style || '') + '</span></span>' +
+      '<span class="sp-bpm">' + ((s && s.bpm) || '--') + ' BPM</span>' +
+      '<span class="sp-stars">' + '★'.repeat(diff) + '</span>' +
+      '<span class="sp-len">' + mm + ':' + ss + '</span>' +
+      '</button>';
+  }).join('');
+  _renderPicker('songPicker', '选择曲目', '接住下落音符 · 下蹲触发清屏技', rows, {
+    emptyText: '曲库为空',
+    onRow: (i) => { const s = list[i]; if (s && typeof onPick === 'function') onPick(s); },
+    onBack: () => { if (typeof onBack === 'function') onBack(); },
+  });
+}
+
+/** 隐藏并销毁选曲面板 */
+export function hideSongPicker() {
+  hidePicker();
+}
+
+/**
+ * 显示乐器选择面板（创作模式）：上次选择的包默认高亮。
+ * @param {Array} packs 乐器包列表（每包 { id, name, desc }，发声逻辑在 game.js）
+ * @param {string} lastId 上次选择的包 id（匹配行加 .cur 高亮，显示“使用中”角标）
+ * @param {{onPick?:Function, onBack?:Function}} cb 选中 / 返回回调
+ */
+export function showInstrumentPicker(packs, lastId, { onPick, onBack } = {}) {
+  const list = Array.isArray(packs) ? packs : [];
+  const rows = list.map((p, i) => {
+    const cur = p && p.id === lastId ? ' cur' : '';
+    return '<button class="sp-row' + cur + '" type="button" data-i="' + i + '">' +
+      '<span class="sp-main"><span class="sp-name">' + _esc(p.name) + '</span>' +
+      '<span class="sp-desc">' + _esc(p.desc || '') + '</span></span>' +
+      '</button>';
+  }).join('');
+  _renderPicker('instrumentPicker', '选择乐器', '选一个乐器，用身体演奏', rows, {
+    emptyText: '乐器库为空',
+    onRow: (i) => { const p = list[i]; if (p && typeof onPick === 'function') onPick(p); },
+    onBack: () => { if (typeof onBack === 'function') onBack(); },
+  });
+}
+
+/** 隐藏并销毁乐器选择面板 */
+export function hideInstrumentPicker() {
+  hidePicker();
+}
+
+/* =====================================================================
  * 初始化
  * ===================================================================== */
 export function initUI({ onModeStart } = {}) {
@@ -254,7 +413,7 @@ export function initUI({ onModeStart } = {}) {
   /* 画中画：点击收起 / 展开 */
   if (dom.camBox) dom.camBox.addEventListener('click', () => togglePiP());
 
-  /* 键盘降级按钮：点按等效按下 J / K / L（派生 KeyboardEvent，game.js 统一监听 document keydown） */
+  /* 键盘降级按钮：点按等效按下 J / K / L / I（派生 KeyboardEvent，game.js 统一监听 document keydown） */
   if (dom.touchPad) {
     dom.touchPad.querySelectorAll('.pad-btn').forEach((btn) => {
       btn.addEventListener('click', () => {

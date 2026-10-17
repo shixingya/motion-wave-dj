@@ -20,6 +20,20 @@
  *   startTrack(style, bpm, {onBeat})   启动程序生成背景曲，返回 {style,bpm}
  *   stopTrack() / getUserTrackInfo() / loadUserFile(file)
  *   noteToFreq('A4')           音名 → 频率，供创作模式映射音阶
+ *
+ * 二期扩展（Taylor）——新音色（t 一律为 ctx.currentTime 体系绝对时间）：
+ *   play808(t, pitch=1)        808 风格长滑 Kick（sine 180→40Hz + tanh 软削波）
+ *   playClap(t)                电鼓 Clap（3 连 10ms 噪声脉冲 + bandpass 1200Hz）
+ *   playSupersaw(freq,t,dur)   EDM 主音（7 osc ±25 cents 扇形 saw + lowpass + ADSR）
+ *   playBell(freq,t,dur)       FM 铃音（频比 3.5 + index 包络）
+ *   playPluck(freq,t,dur)      短促弹拨（saw + 快 lowpass 包络）
+ *   playRiser(t,dur=2)         上扬过渡（噪声扫频 + 双 saw 上滑 + 渐强）
+ *   playImpact(t)              重锤下行（sub 80→30Hz + 噪声爆发 + 卷积混响尾）
+ *   playVocalChop(freq,t,dur)  人声切片（双 detune saw → 双 formant bandpass）
+ *   startSong(song,{onBeat,onNote})  播放 js/tracks.js 曲库整曲，曲尾自动停止；
+ *                                    onNote 提前 ≥2s 通知（下落音符飞行窗口），
+ *                                    onBeat 提前 0.5s 通知；发声仍 0.1s 精确排程
+ *   getUserTrackInfo() 增补 songId / songName 字段
  */
 
 /* ============================ 音名工具 ============================ */
@@ -43,6 +57,30 @@ export function noteToFreq(note) {
 }
 
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+
+/** 和弦质缀 → 半音结构表（parseChord 用） */
+const CHORD_SHAPES = [
+  ['maj', [0, 4, 7]], ['m', [0, 3, 7]], ['7', [0, 4, 7, 10]],
+  ['maj7', [0, 4, 7, 11]], ['m7', [0, 3, 7, 10]], ['dim', [0, 3, 6]],
+  ['aug', [0, 4, 8]], ['sus4', [0, 5, 7]], ['sus2', [0, 2, 7]],
+  ['add9', [0, 4, 7, 14]], ['m7b5', [0, 3, 6, 10]], ['6', [0, 4, 7, 9]],
+];
+
+/**
+ * 和弦名 → 频率数组（铺底用）。
+ * 支持 'C' / 'Am' / 'F#m7' / 'Bb' 等写法，未知质缀按大三和弦处理；解析失败返回 []。
+ * 铺底音区固定从 C3(midi 48) 起堆叠，避免与 lead 打架。
+ */
+export function parseChord(name) {
+  const m = /^([A-Ga-g])([#b♯♭]?)(.*)$/.exec(String(name).trim());
+  if (!m) return [];
+  let semi = NOTE_SEMITONES[m[1].toUpperCase()];
+  if (m[2] === '#' || m[2] === '♯') semi += 1;
+  if (m[2] === 'b' || m[2] === '♭') semi -= 1;
+  const shape = CHORD_SHAPES.find((s) => s[0] === m[3]) || CHORD_SHAPES[0];
+  const rootMidi = 48 + semi;
+  return shape[1].map((iv) => 440 * Math.pow(2, (rootMidi + iv - 69) / 12));
+}
 
 /** 和声走向（相对 A2 的半音偏移）：Am → F → C → G，每小节切换，避免背景曲单调 */
 const CHORD_PROG = [0, -4, 3, -2];
@@ -74,9 +112,22 @@ export class AudioEngine {
       onBeat: null,
       userBuffer: null,       // loadUserFile 解码结果
       userSource: null,       // 循环播放中的用户音频源
+      // song 模式（startSong）专用状态
+      song: null,             // 当前曲库曲目（js/tracks.js 数据）
+      onNote: null,           // lead 音符调度回调
+      totalBars: 0,           // 曲目总小节数
+      leadIndex: null,        // Map<bar, Note[]> 按 bar 预索引的旋律事件（发声用）
+      fxIndex: null,          // Map<bar, Fx[]>   按 bar 预索引的特效事件
+      // 通知/发声解耦：独立通知游标（onNote 提前 2.5s、onBeat 提前 0.5s）
+      noteQueue: null,        // 全曲 lead 通知队列（audioTime 升序，与发声时刻同源）
+      notePtr: 0,             // onNote 通知游标（单调前进，每音符只通知一次）
+      beatQueue: null,        // 全曲拍点通知队列
+      beatPtr: 0,             // onBeat 通知游标
       SCHEDULE_AHEAD: 0.1,    // 提前排程量 100ms
       SCHEDULE_TICK: 25,      // 检查器周期 25ms
     };
+    this._satCurve = null;    // tanh 软削波曲线（play808 用），init 时生成
+    this._impulse = null;     // 程序生成混响 IR（playImpact 用），惰性生成
   }
 
   /* ------------------------ 生命周期 ------------------------ */
@@ -104,6 +155,7 @@ export class AudioEngine {
 
     // 预生成 2s 白噪声（snare/hat/cymbal/guitar 激励共用，满足 cymbal 1.2s 衰减）
     this._noiseBuffer = this._makeNoiseBuffer(2);
+    this._satCurve = this._makeSatCurve();
     return this.ctx;
   }
 
@@ -137,6 +189,31 @@ export class AudioEngine {
   /** 把调度时间规整到不早于当前时刻（排到过去的音符立即响，避免负延迟报错） */
   _t(t) {
     return Math.max(Number(t) || 0, this.ctx.currentTime);
+  }
+
+  /** tanh 软削波曲线：轻微 saturation，让 808 低频更「糊脸」不刺耳 */
+  _makeSatCurve() {
+    const n = 1024;
+    const curve = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const x = (i / (n - 1)) * 2 - 1;
+      curve[i] = Math.tanh(2.2 * x);
+    }
+    return curve;
+  }
+
+  /** 程序生成混响脉冲响应（立体声指数衰减白噪声），playImpact 尾音用 */
+  _makeImpulse(seconds = 1.8, decay = 3.2) {
+    const rate = this.ctx.sampleRate;
+    const len = Math.max(1, Math.floor(rate * seconds));
+    const buf = this.ctx.createBuffer(2, len, rate);
+    for (let ch = 0; ch < 2; ch++) {
+      const d = buf.getChannelData(ch);
+      for (let i = 0; i < len; i++) {
+        d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, decay);
+      }
+    }
+    return buf;
   }
 
   _makeNoiseBuffer(seconds) {
@@ -424,6 +501,314 @@ export class AudioEngine {
     }, ms);
   }
 
+  /* ------------------------ 二期扩展音色组 ------------------------ */
+
+  /**
+   * 808 风格长滑 Kick：sine 从 pitch*180Hz 快滑到 pitch*40Hz，
+   * 衰减 ~0.5s，经 tanh WaveShaper 软削波增加厚度。pitch 缩放整体音高。
+   */
+  play808(t, pitch = 1) {
+    if (!this._ready()) return;
+    t = this._t(t);
+    pitch = clamp(Number(pitch) || 1, 0.25, 4);
+    const osc = this.ctx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(180 * pitch, t);
+    osc.frequency.exponentialRampToValueAtTime(40 * pitch, t + 0.09);
+    const shaper = this.ctx.createWaveShaper();
+    if (!this._satCurve) this._satCurve = this._makeSatCurve();
+    shaper.curve = this._satCurve;
+    const gain = this.ctx.createGain();
+    gain.gain.setValueAtTime(1.0, t);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.5);
+    this._pipe(osc, shaper, gain);
+    osc.start(t);
+    osc.stop(t + 0.55);
+  }
+
+  /**
+   * 电鼓 Clap：同一噪声源经 bandpass(~1200Hz)，包络做 3 个 10ms 间隔
+   * 预脉冲 + 1 个主衰减，模拟多手掌错位拍击。
+   */
+  playClap(t) {
+    if (!this._ready()) return;
+    t = this._t(t);
+    const noise = this.ctx.createBufferSource();
+    noise.buffer = this._noiseBuffer;
+    const bp = this.ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = 1200;
+    bp.Q.value = 1.1;
+    const gain = this.ctx.createGain();
+    const g = gain.gain;
+    g.setValueAtTime(0.0001, t);
+    g.setValueAtTime(0.75, t);
+    g.exponentialRampToValueAtTime(0.18, t + 0.009);
+    g.setValueAtTime(0.75, t + 0.01);
+    g.exponentialRampToValueAtTime(0.18, t + 0.019);
+    g.setValueAtTime(0.75, t + 0.02);
+    g.exponentialRampToValueAtTime(0.2, t + 0.029);
+    g.setValueAtTime(0.85, t + 0.03);
+    g.exponentialRampToValueAtTime(0.001, t + 0.24);
+    this._pipe(noise, bp, gain);
+    noise.start(t);
+    noise.stop(t + 0.27);
+  }
+
+  /**
+   * Supersaw：7 个 sawtooth 以 ±25 cents 扇形展开（0 居中，两侧等比对称），
+   * 汇入 lowpass 后由 ADSR 控制总包络。EDM 主音色。
+   */
+  playSupersaw(freq, t, dur = 0.5) {
+    if (!this._ready()) return;
+    t = this._t(t);
+    freq = clamp(Number(freq) || 440, 40, 6000);
+    dur = clamp(Number(dur) || 0.5, 0.05, 4);
+    const ctx = this.ctx;
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.value = clamp(freq * 5, 900, 9500);
+    lp.Q.value = 0.8;
+    const gain = ctx.createGain();
+    const relEnd = this._adsr(gain.gain, t, dur, {
+      peak: 0.34, attack: 0.012, decay: 0.09, sustain: 0.72, release: 0.14,
+    });
+    const DETUNES = [-25, -16.7, -8.3, 0, 8.3, 16.7, 25];
+    const oscs = [];
+    const nodes = [lp, gain];
+    for (const d of DETUNES) {
+      const o = ctx.createOscillator();
+      o.type = 'sawtooth';
+      o.frequency.value = freq;
+      o.detune.value = d;
+      const og = ctx.createGain();
+      og.gain.value = 0.12;
+      o.connect(og);
+      og.connect(lp);
+      oscs.push(o);
+      nodes.push(o, og);
+    }
+    lp.connect(gain);
+    gain.connect(this.master);
+    this._own(oscs, nodes);
+    for (const o of oscs) {
+      o.start(t);
+      o.stop(t + relEnd + 0.05);
+    }
+  }
+
+  /**
+   * FM 铃音：carrier(sine) 被 modulator(sine, 频比 3.5) 调频，
+   * modulation index 随时间指数衰减（亮→净），清脆梦幻。
+   */
+  playBell(freq, t, dur = 0.9) {
+    if (!this._ready()) return;
+    t = this._t(t);
+    freq = clamp(Number(freq) || 880, 100, 8000);
+    dur = clamp(Number(dur) || 0.9, 0.1, 3);
+    const ctx = this.ctx;
+    const carrier = ctx.createOscillator();
+    carrier.type = 'sine';
+    carrier.frequency.value = freq;
+    const mod = ctx.createOscillator();
+    mod.type = 'sine';
+    mod.frequency.value = freq * 3.5;
+    const modGain = ctx.createGain();
+    modGain.gain.setValueAtTime(freq * 2.4, t);
+    modGain.gain.exponentialRampToValueAtTime(freq * 0.05, t + Math.max(0.08, dur * 0.75));
+    const gain = ctx.createGain();
+    const relEnd = this._adsr(gain.gain, t, dur, {
+      peak: 0.42, attack: 0.004, decay: Math.max(0.12, dur * 0.55), sustain: 0.12, release: 0.35,
+    });
+    mod.connect(modGain);
+    modGain.connect(carrier.frequency);
+    this._pipe(carrier, gain);
+    this._own([mod], [mod, modGain]);
+    mod.start(t);
+    mod.stop(t + relEnd + 0.05);
+    carrier.start(t);
+    carrier.stop(t + relEnd + 0.05);
+  }
+
+  /**
+   * Pluck：saw + lowpass 包络（cutoff 从 freq*9 快落到 freq*1.2）+
+   * 快衰减增益包络，短促弹拨，适合琶音 / Chiptune 近似方波主音。
+   */
+  playPluck(freq, t, dur = 0.25) {
+    if (!this._ready()) return;
+    t = this._t(t);
+    freq = clamp(Number(freq) || 440, 40, 8000);
+    dur = clamp(Number(dur) || 0.25, 0.05, 1.5);
+    const osc = this.ctx.createOscillator();
+    osc.type = 'sawtooth';
+    osc.frequency.value = freq;
+    const lp = this.ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.Q.value = 4;
+    lp.frequency.setValueAtTime(clamp(freq * 9, 700, 12000), t);
+    lp.frequency.exponentialRampToValueAtTime(Math.max(freq * 1.2, 180), t + Math.max(0.05, dur * 0.7));
+    const gain = this.ctx.createGain();
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(0.5, t + 0.004);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + Math.max(0.1, dur));
+    this._pipe(osc, lp, gain);
+    osc.start(t);
+    osc.stop(t + Math.max(0.1, dur) + 0.06);
+  }
+
+  /**
+   * Riser：噪声 bandpass 扫频(300→6500Hz) + 双 detune saw 上滑(110→880Hz)，
+   * 双层同时渐强，用于乐段过渡，结尾交由 impact 收爆。
+   */
+  playRiser(t, dur = 2) {
+    if (!this._ready()) return;
+    t = this._t(t);
+    dur = clamp(Number(dur) || 2, 0.5, 4);
+    const ctx = this.ctx;
+    const end = t + dur;
+    // 噪声层
+    const noise = ctx.createBufferSource();
+    noise.buffer = this._noiseBuffer;
+    noise.loop = true; // dur 可达 4s，超出 2s buffer 需循环
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.Q.value = 1.4;
+    bp.frequency.setValueAtTime(300, t);
+    bp.frequency.exponentialRampToValueAtTime(6500, end);
+    const nGain = ctx.createGain();
+    nGain.gain.setValueAtTime(0.05, t);
+    nGain.gain.exponentialRampToValueAtTime(0.3, end);
+    this._pipe(noise, bp, nGain);
+    noise.start(t);
+    noise.stop(end + 0.05);
+    // 锯齿层
+    const sGain = ctx.createGain();
+    sGain.gain.setValueAtTime(0.04, t);
+    sGain.gain.exponentialRampToValueAtTime(0.16, end);
+    const oscs = [];
+    const nodes = [sGain];
+    for (const d of [-9, 9]) {
+      const o = ctx.createOscillator();
+      o.type = 'sawtooth';
+      o.frequency.setValueAtTime(110, t);
+      o.frequency.exponentialRampToValueAtTime(880, end);
+      o.detune.value = d;
+      const og = ctx.createGain();
+      og.gain.value = 0.5;
+      o.connect(og);
+      og.connect(sGain);
+      oscs.push(o);
+      nodes.push(o, og);
+    }
+    sGain.connect(this.master);
+    this._own(oscs, nodes);
+    for (const o of oscs) {
+      o.start(t);
+      o.stop(end + 0.05);
+    }
+  }
+
+  /**
+   * Impact：重锤下行三层叠加 ——
+   * 1) sub sine 80→30Hz 长衰减；2) 噪声 lowpass 爆发（2400→220Hz）；
+   * 3) 噪声经程序生成卷积混响的 1.9s 衰减尾音。用于段落起点。
+   */
+  playImpact(t) {
+    if (!this._ready()) return;
+    t = this._t(t);
+    const ctx = this.ctx;
+    // sub 下行
+    const sub = ctx.createOscillator();
+    sub.type = 'sine';
+    sub.frequency.setValueAtTime(80, t);
+    sub.frequency.exponentialRampToValueAtTime(30, t + 0.45);
+    const subG = ctx.createGain();
+    subG.gain.setValueAtTime(0.9, t);
+    subG.gain.exponentialRampToValueAtTime(0.001, t + 1.3);
+    this._pipe(sub, subG);
+    sub.start(t);
+    sub.stop(t + 1.35);
+    // 噪声爆点
+    const noise = ctx.createBufferSource();
+    noise.buffer = this._noiseBuffer;
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.setValueAtTime(2400, t);
+    lp.frequency.exponentialRampToValueAtTime(220, t + 0.5);
+    const nG = ctx.createGain();
+    nG.gain.setValueAtTime(0.7, t);
+    nG.gain.exponentialRampToValueAtTime(0.001, t + 0.55);
+    this._pipe(noise, lp, nG);
+    noise.start(t);
+    noise.stop(t + 0.6);
+    // 混响尾
+    if (!this._impulse) this._impulse = this._makeImpulse();
+    const tail = ctx.createBufferSource();
+    tail.buffer = this._noiseBuffer;
+    tail.loop = true;
+    const tailG = ctx.createGain();
+    tailG.gain.setValueAtTime(0.25, t);
+    tailG.gain.exponentialRampToValueAtTime(0.001, t + 1.9);
+    const verb = ctx.createConvolver();
+    verb.buffer = this._impulse;
+    const vlp = ctx.createBiquadFilter();
+    vlp.type = 'lowpass';
+    vlp.frequency.value = 1500;
+    this._pipe(tail, tailG, verb, vlp);
+    tail.start(t);
+    tail.stop(t + 2.0);
+  }
+
+  /**
+   * Vocal Chop：双 detune(±8 cents) saw 并联进两个 formant bandpass
+   * (~800Hz / ~1200Hz) 模拟元音共振峰，短包络，有趣的「人声切片」感。
+   */
+  playVocalChop(freq, t, dur = 0.3) {
+    if (!this._ready()) return;
+    t = this._t(t);
+    freq = clamp(Number(freq) || 440, 80, 3000);
+    dur = clamp(Number(dur) || 0.3, 0.05, 1);
+    const ctx = this.ctx;
+    const sum = ctx.createGain();
+    sum.gain.value = 1;
+    const FORMANTS = [
+      { f: 800, q: 6, g: 0.6 },
+      { f: 1200, q: 6, g: 0.45 },
+    ];
+    const oscs = [];
+    const nodes = [sum];
+    for (const d of [-8, 8]) {
+      const o = ctx.createOscillator();
+      o.type = 'sawtooth';
+      o.frequency.value = freq;
+      o.detune.value = d;
+      oscs.push(o);
+    }
+    for (const fm of FORMANTS) {
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.value = fm.f;
+      bp.Q.value = fm.q;
+      const bg = ctx.createGain();
+      bg.gain.value = fm.g;
+      nodes.push(bp, bg);
+      for (const o of oscs) o.connect(bp);
+      bp.connect(bg);
+      bg.connect(sum);
+    }
+    const gain = ctx.createGain();
+    const relEnd = this._adsr(gain.gain, t, dur, {
+      peak: 0.55, attack: 0.012, decay: 0.06, sustain: 0.55, release: 0.09,
+    });
+    sum.connect(gain);
+    gain.connect(this.master);
+    this._own(oscs, [...nodes, ...oscs, gain]);
+    for (const o of oscs) {
+      o.start(t);
+      o.stop(t + relEnd + 0.05);
+    }
+  }
+
   /* ------------------------ 音序器（A Tale of Two Clocks） ------------------------ */
 
   /**
@@ -466,10 +851,185 @@ export class AudioEngine {
     return { style: track.style, bpm: track.bpm };
   }
 
+  /**
+   * 播放 js/tracks.js 曲库整曲（startTrack 互斥，启动前先停另一个）。
+   * 沿用同一套 lookahead 调度器：drum pattern 每 16 步循环，
+   * bass 按小节（或 4 小节变体）循环，lead/fx 按 bar 预索引后逐 step 命中；
+   * 调度到 lengthBeats 曲尾自动停止（已排程尾音自然衰减，不硬切）。
+   *
+   * 通知与发声解耦：发声仍走 0.1s lookahead 精确排程；onNote/onBeat 走独立
+   * 通知游标（notePtr/beatPtr），每次调度 tick 把 audioTime ≤ now+2.5s 的 lead
+   * 事件依次触发 onNote（下落音符有 ≥2s 飞行窗口）、audioTime ≤ now+0.5s 的
+   * 拍点触发 onBeat；指针单调前进，每事件只通知一次；曲尾自然停止前通知已全部
+   * 发完；stopTrack/_finishSong 清理游标，重开不重复通知。
+   *
+   * @param {object} song  曲库曲目（见 js/tracks.js 契约）
+   * @param {{onBeat?:Function, onNote?:Function}} opts
+   *        onBeat(beatIndex, barIndex, audioTime)  每拍回调，提前 ~0.5s；
+   *        onNote({audioTime, lane, freq, dur, wave}) lead 通知，提前 ≥2s
+   *        （audioTime 为精确 AudioContext 时刻 = 发声时刻，供 game.js 生成下落音符）。
+   * @returns {{running,style,bpm,songId,songName}}
+   */
+  startSong(song, opts = {}) {
+    if (!this.ctx) this.init();
+    if (!song || !Array.isArray(song.lead)) {
+      throw new Error('startSong: 无效的曲目数据（缺少 lead 数组）');
+    }
+    this.stopTrack(); // 与 startTrack 互斥
+    const track = this._track;
+
+    track.mode = 'song';
+    track.song = song;
+    track.style = String(song.style || 'song');
+    track.bpm = clamp(Math.round(Number(song.bpm) || 120), 50, 200);
+    track.stepDur = Math.max((60 / track.bpm) / 4, 0.05);
+    track.totalBars = Math.max(1, Math.ceil((Number(song.lengthBeats) || 64) / 4));
+    track.step = 0;
+    track.beatIndex = 0;
+    track.barIndex = 0;
+    track.onBeat = typeof (opts && opts.onBeat) === 'function' ? opts.onBeat : null;
+    track.onNote = typeof (opts && opts.onNote) === 'function' ? opts.onNote : null;
+    track.leadIndex = this._indexBy(song.lead, 'bar');
+    track.fxIndex = this._indexBy(song.fx || [], 'bar');
+
+    track.nextStepTime = this.ctx.currentTime + 0.06;
+    // 通知队列与发声时间轴同源：audioTime = startAudio + stepIdx * stepDur，
+    // 保证 onNote.audioTime 与发声 audioTime 完全一致（game.js 的 hitTime 依据）
+    const startAudio = track.nextStepTime;
+    track.noteQueue = this._buildNoteQueue(song, startAudio, track.totalBars, track.stepDur);
+    track.beatQueue = this._buildBeatQueue(track.totalBars, startAudio, track.stepDur);
+    track.notePtr = 0;
+    track.beatPtr = 0;
+    track.running = true;
+    track.timer = setInterval(() => this._scheduler(), track.SCHEDULE_TICK);
+    this._scheduler();
+    return this.getUserTrackInfo();
+  }
+
+  /** 构建全曲 lead 通知队列：audioTime 与发声排程同源，升序供游标单调扫描 */
+  _buildNoteQueue(song, startAudio, totalBars, stepDur) {
+    const beatDur = stepDur * 4;
+    const queue = [];
+    for (const ev of song.lead) {
+      if (!ev || typeof ev !== 'object') continue;
+      const bar = Number(ev.bar);
+      const step = Number(ev.step);
+      if (!(bar >= 0 && bar < totalBars && step >= 0 && step <= 15)) continue;
+      queue.push({
+        audioTime: startAudio + (bar * 16 + step) * stepDur,
+        lane: Number(ev.lane) | 0,
+        freq: noteToFreq(ev.note),
+        dur: clamp((Number(ev.dur) || 1) * beatDur, 0.05, 4),
+        wave: typeof ev.wave === 'string' ? ev.wave : 'supersaw',
+      });
+    }
+    queue.sort((a, b) => a.audioTime - b.audioTime);
+    return queue;
+  }
+
+  /** 构建全曲拍点通知队列（每小节 4 拍，beatIndex 全曲连续递增，天然有序） */
+  _buildBeatQueue(totalBars, startAudio, stepDur) {
+    const queue = [];
+    for (let bar = 0; bar < totalBars; bar++) {
+      for (let b = 0; b < 4; b++) {
+        queue.push({
+          audioTime: startAudio + (bar * 16 + b * 4) * stepDur,
+          beatIndex: bar * 4 + b,
+          barIndex: bar,
+        });
+      }
+    }
+    return queue;
+  }
+
+  /**
+   * 通知 tick（仅 song 模式）：推进独立通知游标，与发声调度解耦。
+   * onNote 视界 now+2.5s（下落音符 travel=min(2.0, hitTime-收到时刻) ≥ 2s）；
+   * onBeat 视界 now+0.5s（视觉脉冲容错）。指针单调前进 → 无重复通知；
+   * startSong 首次 _scheduler() 即调本方法 → 开局 0~2.5s 窗口内的音符不迟到。
+   */
+  _notifyTick() {
+    const track = this._track;
+    if (!track.running || track.mode !== 'song' || !this.ctx) return;
+    const now = this.ctx.currentTime;
+    if (track.onNote && track.noteQueue) {
+      const horizon = now + 2.5;
+      while (track.notePtr < track.noteQueue.length && track.noteQueue[track.notePtr].audioTime <= horizon) {
+        const ev = track.noteQueue[track.notePtr++];
+        track.onNote({ audioTime: ev.audioTime, lane: ev.lane, freq: ev.freq, dur: ev.dur, wave: ev.wave });
+      }
+    }
+    if (track.onBeat && track.beatQueue) {
+      const horizon = now + 0.5;
+      while (track.beatPtr < track.beatQueue.length && track.beatQueue[track.beatPtr].audioTime <= horizon) {
+        const b = track.beatQueue[track.beatPtr++];
+        track.onBeat(b.beatIndex, b.barIndex, b.audioTime);
+      }
+    }
+  }
+
+  /** 按 key 把事件数组预索引成 Map<keyValue, events[]>，避免每步全表扫描 */
+  _indexBy(events, key) {
+    const map = new Map();
+    for (const ev of events) {
+      if (!ev || typeof ev !== 'object') continue;
+      const k = Number(ev[key]);
+      if (!Number.isFinite(k)) continue;
+      if (!map.has(k)) map.set(k, []);
+      map.get(k).push(ev);
+    }
+    return map;
+  }
+
+  /** 曲尾自然收尾：停调度器与回调，但不硬切已排程的尾音（混响/铃音自然衰减） */
+  _finishSong() {
+    const track = this._track;
+    track.running = false;
+    track.mode = 'synth';
+    if (track.timer) {
+      clearInterval(track.timer);
+      track.timer = null;
+    }
+    track.song = null;
+    track.onBeat = null;
+    track.onNote = null;
+    track.leadIndex = null;
+    track.fxIndex = null;
+    track.noteQueue = null;
+    track.notePtr = 0;
+    track.beatQueue = null;
+    track.beatPtr = 0;
+  }
+
+  /** lead.wave → 对应合成音色（默认 supersaw） */
+  _playLeadWave(wave, freq, t, dur) {
+    switch (wave) {
+      case 'bell': this.playBell(freq, t, dur); break;
+      case 'pluck': this.playPluck(freq, t, dur); break;
+      case 'vocal': this.playVocalChop(freq, t, dur); break;
+      case 'supersaw':
+      default: this.playSupersaw(freq, t, dur); break;
+    }
+  }
+
+  /** 低音量铺底：复用 piano voice，每音 level 压到 ~0.12，只填和声空间 */
+  _playPad(t, dur, freqs) {
+    for (const f of freqs) this._playPianoVoice(f, t, dur, 0.12);
+  }
+
   /** 停止音序器：清 interval、断用户音频源、安全停止已排程未发声节点 */
   stopTrack() {
     const track = this._track;
     track.running = false;
+    track.mode = 'synth';
+    track.song = null;
+    track.onNote = null;
+    track.leadIndex = null;
+    track.fxIndex = null;
+    track.noteQueue = null;
+    track.notePtr = 0;
+    track.beatQueue = null;
+    track.beatPtr = 0;
     if (track.timer) {
       clearInterval(track.timer);
       track.timer = null;
@@ -487,17 +1047,34 @@ export class AudioEngine {
     this._active.clear();
   }
 
-  /** @returns {{running:boolean, style:string|null, bpm:number}} */
+  /** @returns {{running:boolean, style:string|null, bpm:number, songId:string|null, songName:string|null}} */
   getUserTrackInfo() {
     const t = this._track;
-    return { running: t.running, style: t.style, bpm: t.bpm };
+    const info = {
+      running: t.running,
+      style: t.style,
+      bpm: t.bpm,
+      songId: null,
+      songName: null,
+    };
+    if (t.mode === 'song' && t.song) {
+      info.songId = t.song.id || null;
+      info.songName = t.song.name || null;
+    }
+    return info;
   }
 
   /** 检查器：25ms 一次，把未来 0.1s 内的步进全部精确排程 */
   _scheduler() {
     const track = this._track;
     if (!track.running || !this.ctx) return;
+    this._notifyTick(); // 通知与发声解耦：每 tick 先推进通知游标（含 startSong 首调，开局音符不迟到）
     while (track.nextStepTime < this.ctx.currentTime + track.SCHEDULE_AHEAD) {
+      // song 模式：最后一小节的 step 15 排完后（barIndex 推到曲尾）自动收尾
+      if (track.mode === 'song' && track.barIndex >= track.totalBars) {
+        this._finishSong();
+        return;
+      }
       this._scheduleStep(track.step, track.nextStepTime);
       track.nextStepTime += track.stepDur;
       track.step = (track.step + 1) % 16;
@@ -505,10 +1082,16 @@ export class AudioEngine {
     }
   }
 
-  /** 单步排程：file 模式只发 onBeat；synth 模式按风格排乐器并同拍发 onBeat */
+  /**
+   * 单步排程（发声）：file 模式只排节拍；song 模式按曲库数据排乐器；
+   * synth 模式按风格排乐器。song 模式的 onBeat/onNote 已由通知游标
+   * （_notifyTick）提前发出，此处不再发，避免重复通知。
+   */
   _scheduleStep(step, time) {
     const track = this._track;
-    if (track.mode !== 'file') {
+    if (track.mode === 'song') {
+      this._scheduleSongStep(step, time);
+    } else if (track.mode !== 'file') {
       switch (track.style) {
         case 'edm': this._patternEdm(step, time, track.barIndex); break;
         case 'funk': this._patternFunk(step, time, track.barIndex); break;
@@ -516,9 +1099,75 @@ export class AudioEngine {
         default: this._patternHouse(step, time, track.barIndex); break;
       }
     }
-    if (step % 4 === 0 && track.onBeat) {
+    if (track.mode !== 'song' && step % 4 === 0 && track.onBeat) {
       track.onBeat(track.beatIndex, track.barIndex, time);
       track.beatIndex++;
+    }
+  }
+
+  /**
+   * song 模式单步排程（16 步/小节，drum pattern 循环）：
+   * drum 各轨道按 pattern 命中；bass 支持平铺或 4 小节变体数组，
+   * bassVoice='808' 时用 play808（pitch=freq/40）；
+   * chordProg 每小节一个和弦在 step0 铺底（音量低）；
+   * lead/fx 按 bar 预索引命中，lead 同时发 onNote 回调。
+   */
+  _scheduleSongStep(step, time) {
+    const track = this._track;
+    const song = track.song;
+    const bar = track.barIndex;
+    const beatDur = track.stepDur * 4;
+
+    // ---- 鼓组（16 步 pattern 循环） ----
+    const drum = song.drum || {};
+    if (Array.isArray(drum.kick) && drum.kick.includes(step)) this.playKick(time);
+    if (Array.isArray(drum.snare) && drum.snare.includes(step)) this.playSnare(time);
+    if (Array.isArray(drum.hatC) && drum.hatC.includes(step)) this.playHat(time, false);
+    if (Array.isArray(drum.hatO) && drum.hatO.includes(step)) this.playHat(time, true);
+    if (Array.isArray(drum.clap) && drum.clap.includes(step)) this.playClap(time);
+
+    // ---- Bass（平铺数组每小节循环，或 4 小节变体数组） ----
+    const bassPat = Array.isArray(song.bass) && Array.isArray(song.bass[0])
+      ? song.bass[bar % song.bass.length]
+      : song.bass;
+    if (Array.isArray(bassPat)) {
+      for (const ev of bassPat) {
+        if (!ev || ev.step !== step) continue;
+        const freq = noteToFreq(ev.note);
+        if (song.bassVoice === '808') {
+          this.play808(time, freq / 40);
+        } else {
+          this.playBass(freq, time, clamp((Number(ev.dur) || 0.5) * beatDur, 0.05, 2));
+        }
+      }
+    }
+
+    // ---- 和弦铺底（step0 每小节一次，音量低） ----
+    if (step === 0 && Array.isArray(song.chordProg) && song.chordProg.length) {
+      const freqs = parseChord(song.chordProg[bar % song.chordProg.length]);
+      if (freqs.length) this._playPad(time, beatDur * 3.8, freqs);
+    }
+
+    // ---- Lead 旋律（预索引后按 step 命中；onNote 通知已由游标提前 2.5s 发出） ----
+    const leadEvents = track.leadIndex && track.leadIndex.get(bar);
+    if (leadEvents) {
+      for (const ev of leadEvents) {
+        if (ev.step !== step) continue;
+        const freq = noteToFreq(ev.note);
+        const dur = clamp((Number(ev.dur) || 1) * beatDur, 0.05, 4);
+        const wave = typeof ev.wave === 'string' ? ev.wave : 'supersaw';
+        this._playLeadWave(wave, freq, time, dur);
+      }
+    }
+
+    // ---- 段落特效 ----
+    const fxEvents = track.fxIndex && track.fxIndex.get(bar);
+    if (fxEvents) {
+      for (const ev of fxEvents) {
+        if (!ev || ev.step !== step) continue;
+        if (ev.type === 'riser') this.playRiser(time, Number(ev.dur) || 2);
+        else if (ev.type === 'impact') this.playImpact(time);
+      }
     }
   }
 
