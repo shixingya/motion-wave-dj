@@ -1,0 +1,55 @@
+# =====================================================================
+# MOTION WAVE DJ · GitHub Pages 部署工作流
+# ---------------------------------------------------------------------
+# 说明：本项目为纯前端零构建静态站点（原生 ESM + importmap），
+#       无需任何构建步骤，整仓即部署产物。
+# 上线地址：https://shixingya.github.io/motion-wave-dj/
+# =====================================================================
+
+name: Deploy to GitHub Pages
+
+# ------------------------------ 触发条件 ------------------------------
+on:
+  push:
+    branches: [main]      # 仅 main 分支推送时自动部署
+  workflow_dispatch:      # 允许在 Actions 页面手动触发
+
+# ------------------------------ 权限声明 ------------------------------
+# Pages 部署的最小权限集：读代码、写 Pages、OIDC 令牌（deploy-pages 鉴权必需）
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# ------------------------------ 并发控制 ------------------------------
+# 同组部署串行化：新一次部署开始时取消仍在运行的旧任务，避免排队堆积
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+# ------------------------------ 部署任务 ------------------------------
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      # 1. 拉取仓库代码
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2. 初始化 GitHub Pages 配置（启用 Pages 并生成部署元数据）
+      - name: Configure Pages
+        uses: actions/configure-pages@v4
+
+      # 3. 上传整仓为部署产物（path 指向仓库根，纯静态无构建）
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: '.'
+
+      # 4. 正式发布到 GitHub Pages
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

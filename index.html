@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="theme-color" content="#05010f">
+<title>MOTION WAVE DJ · 体感 DJ 节奏游戏</title>
+<link rel="stylesheet" href="css/style.css">
+<!-- importmap：供 stage3d.js（Three.js 3D 舞台）使用，契约固定，勿改 -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+
+  <!-- 全屏 3D 画布：stage3d.js 渲染目标 -->
+  <canvas id="gameCanvas"></canvas>
+
+  <!-- 顶部 HUD：双人时 p2 区显示，单人隐藏 -->
+  <div id="hudTop" class="hidden">
+    <div class="hud-player hud-p1" id="p1Area">
+      <div class="hud-label">玩家 1</div>
+      <div class="hud-score" id="p1Score">0</div>
+      <div class="hud-combo" id="p1Combo">COMBO ×0</div>
+    </div>
+    <div class="hud-track" id="trackInfo">TRACK · -- · BPM --</div>
+    <div class="hud-player hud-p2" id="p2Area" hidden>
+      <div class="hud-label">玩家 2</div>
+      <div class="hud-score" id="p2Score">0</div>
+      <div class="hud-combo" id="p2Combo">COMBO ×0</div>
+    </div>
+  </div>
+
+  <!-- 中央提示：判定文字（PERFECT/GOOD/MISS）与动作提示 -->
+  <div id="centerMsg" aria-live="polite"></div>
+
+  <!-- 右下角画中画小窗：摄像头 + 骨架叠加，点击收起/展开 -->
+  <div id="camBox" title="点击收起 / 展开">
+    <video id="camVideo" autoplay playsinline muted></video>
+    <canvas id="skelCanvas"></canvas>
+    <span class="pip-tag" id="pipTag">PIP</span>
+  </div>
+
+  <!-- 键盘降级按钮区：移动端 / 无摄像头时显示（J=左打击 K=右打击 L=下蹲 I=双手） -->
+  <div id="touchPad" hidden>
+    <div class="pad-tip">无摄像头 · 键盘 / 点按降级</div>
+    <div class="pad-row">
+      <button class="pad-btn pad-left" data-key="KeyJ" aria-label="左打击（J 键）">J<span>左打击</span></button>
+      <button class="pad-btn pad-right" data-key="KeyK" aria-label="右打击（K 键）">K<span>右打击</span></button>
+      <button class="pad-btn pad-mid" data-key="KeyL" aria-label="下蹲（L 键）">L<span>下蹲</span></button>
+      <button class="pad-btn pad-mid" data-key="KeyI" aria-label="双手高举（I 键）">I<span>双手</span></button>
+    </div>
+  </div>
+
+  <!-- 模式选择菜单覆盖层：由 ui.js 动态填充 -->
+  <div id="menuOverlay"></div>
+
+  <!-- 动作引导弹窗：大字号中文说明，开始前展示 -->
+  <div id="guideModal" hidden>
+    <div class="guide-card">
+      <h2 class="guide-title">动作说明</h2>
+      <ul class="guide-list">
+        <li><span class="g-icon">⬅️</span><b>左臂高举</b><i>左打击</i></li>
+        <li><span class="g-icon">➡️</span><b>右臂高举</b><i>右打击</i></li>
+        <li><span class="g-icon">🙌</span><b>双手高举</b><i>重拍</i></li>
+        <li><span class="g-icon">🦵</span><b>下蹲</b><i>低音炮</i></li>
+      </ul>
+      <p class="guide-kb">没有摄像头？用键盘 <kbd>J</kbd> <kbd>K</kbd> <kbd>L</kbd> <kbd>I</kbd> 代替打击动作（左 / 右 / 下蹲 / 双手）</p>
+      <button class="guide-ok" id="guideOkBtn" type="button">我知道了，开始！</button>
+    </div>
+  </div>
+
+  <!-- 调试面板：按 D 开关（默认隐藏） -->
+  <div id="debugPanel" hidden></div>
+
+  <!-- 加载遮罩：感知层 / 资源就绪后由 ui.js 隐藏 -->
+  <div id="loadingMask">
+    <div class="loading-ring"></div>
+    <div class="loading-text" id="loadingText">正在初始化舞台…</div>
+  </div>
+
+  <!-- 主控制器：游戏状态机 / 三模式玩法 / 节拍对齐判定与计分（任务 4 · Jay） -->
+  <script type="module" src="./js/game.js"></script>
+</body>
+</html>
